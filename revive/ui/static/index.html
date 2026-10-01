@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revive - phone repair toolkit</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --line:#2a3240; --fg:#e6edf3;
+    --dim:#8b949e; --acc:#4da3ff; --ok:#3fb950; --warn:#d29922; --err:#f85149; --fatal:#db61a2;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:14px;padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  header h1{margin:0;font-size:17px;letter-spacing:.4px}
+  header h1 span{color:var(--acc)}
+  .badge{font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--dim)}
+  .badge.demo{color:var(--warn);border-color:#5a4a12;background:#2a2109}
+  .badge.live{color:var(--ok);border-color:#1c3d24;background:#0f2415}
+  nav{display:flex;gap:2px;padding:0 12px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);padding:10px 14px;cursor:pointer;font-size:14px}
+  nav button:hover{color:var(--fg)}
+  nav button.active{color:var(--fg);border-bottom-color:var(--acc)}
+  main{padding:18px;max-width:1180px;margin:0 auto}
+  section{display:none;animation:fade .15s ease-in}
+  section.active{display:block}
+  @keyframes fade{from{opacity:.4}to{opacity:1}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+  .card h2{margin:0 0 4px;font-size:15px}
+  .card p.sub{margin:0 0 12px;color:var(--dim);font-size:13px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  input[type=text],textarea,select{background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:9px 11px;font-family:var(--mono);font-size:13px;min-width:0}
+  input[type=text]{flex:1 1 320px}
+  textarea{width:100%;min-height:110px}
+  button.primary{background:var(--acc);color:#04121f;border:0;border-radius:8px;padding:9px 16px;font-weight:600;cursor:pointer}
+  button.ghost{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:9px 14px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:progress}
+  .muted{color:var(--dim)}
+  .findings{list-style:none;padding:0;margin:0}
+  .finding{border-left:3px solid var(--line);background:var(--panel2);border-radius:0 8px 8px 0;padding:10px 12px;margin-bottom:8px}
+  .finding.ok{border-left-color:var(--ok)} .finding.info{border-left-color:var(--acc)}
+  .finding.warn{border-left-color:var(--warn)} .finding.error{border-left-color:var(--err)}
+  .finding.fatal{border-left-color:var(--fatal)}
+  .finding b{display:block;margin-bottom:2px}
+  .finding .fix{margin:6px 0 0;padding-left:18px;color:var(--dim);font-size:13px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;position:sticky;top:0;background:var(--panel)}
+  td.mono,th.mono{font-family:var(--mono)}
+  .scroll{max-height:440px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+  .kv{display:grid;grid-template-columns:200px 1fr;gap:4px 14px;font-size:13px}
+  .kv div:nth-child(odd){color:var(--dim)}
+  .risk{display:inline-block;padding:3px 10px;border-radius:99px;font-weight:600;font-size:12px}
+  .risk.low{background:#0f2415;color:var(--ok)} .risk.medium{background:#2a2109;color:var(--warn)}
+  .risk.high{background:#3a1417;color:var(--err)} .risk.blocked{background:#33121f;color:var(--fatal)}
+  .risk.unknown{background:var(--panel2);color:var(--dim)}
+  pre{background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;font-family:var(--mono);font-size:12.5px;max-height:420px}
+  #jobs{position:fixed;right:16px;bottom:16px;width:340px;max-height:60vh;overflow:auto;display:none;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;z-index:10;box-shadow:0 8px 30px #0008}
+  .bar{height:6px;background:var(--panel2);border-radius:99px;overflow:hidden;margin:6px 0}
+  .bar i{display:block;height:100%;background:var(--acc);width:0;transition:width .2s}
+  code{background:var(--panel2);padding:1px 5px;border-radius:5px;font-family:var(--mono);font-size:12.5px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:820px){.grid2{grid-template-columns:1fr}.kv{grid-template-columns:1fr}}
+  .hint{font-size:12.5px;color:var(--dim);margin-top:8px}
+  .pill{font-size:11px;border:1px solid var(--line);border-radius:99px;padding:1px 7px;color:var(--dim);margin-left:6px}
+  .danger-zone{border-color:#4a1d24}
+</style>
+</head>
+<body>
+<header>
+  <h1>Re<span>vive</span></h1>
+  <span class="badge" id="version">loading…</span>
+  <span class="badge" id="mode-badge">checking</span>
+  <span class="badge" id="usb-badge">USB ?</span>
+  <span style="flex:1"></span>
+  <button class="ghost" id="btn-demo">Demo data</button>
+</header>
+
+<nav>
+  <button data-tab="device" class="active">Device</button>
+  <button data-tab="firmware">Firmware</button>
+  <button data-tab="dump">Dump surgery</button>
+  <button data-tab="tools">File tools</button>
+  <button data-tab="errors">Error decoder</button>
+  <button data-tab="guide">Guide</button>
+</nav>
+
+<main>
+  <!-- DEVICE -->
+  <section id="tab-device" class="active">
+    <div class="card">
+      <h2>1. What is the phone doing right now?</h2>
+      <p class="sub">Read-only detection. Revive never writes to a device without a validated plan and an explicit confirmation.</p>
+      <div class="row">
+        <button class="primary" id="btn-detect">Detect device</button>
+        <button class="ghost" id="btn-identify">Identify chip &amp; storage</button>
+        <label class="muted"><input type="checkbox" id="chk-demo" checked> use simulated device</label>
+      </div>
+      <div id="detect-out"></div>
+    </div>
+    <div class="card">
+      <h2>2. Order of operations that does not brick phones</h2>
+      <p class="sub">Follow this every time. Skipping step 1 is how data is lost.</p>
+      <table>
+        <tr><th style="width:34px">#</th><th>Step</th><th>Why</th></tr>
+        <tr><td>1</td><td>Back up what still reads</td><td>Dying eMMC only gets worse; a backup is the only irreplaceable thing here</td></tr>
+        <tr><td>2</td><td>Identify the chip and the security state</td><td>Decides whether you need an auth file before you even try to flash</td></tr>
+        <tr><td>3</td><td>Verify the firmware matches the model</td><td>Wrong-model firmware is the number one hard-brick cause</td></tr>
+        <tr><td>4</td><td>Read the dry-run plan</td><td>See every write, its size and target before it happens</td></tr>
+        <tr><td>5</td><td>Flash, then verify the read-back</td><td>A flash that is not verified is a hope, not a repair</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- FIRMWARE -->
+  <section id="tab-firmware">
+    <div class="card">
+      <h2>Firmware package check</h2>
+      <p class="sub">Point at the extracted firmware folder (or a single file). Revive works out the format, validates every file, and prints a dry-run plan.</p>
+      <div class="row">
+        <input type="text" id="fw-path" placeholder="/path/to/firmware_folder  (or a single .img/.pac/scatter)" spellcheck="false">
+        <button class="primary" id="btn-inspect">Inspect</button>
+        <button class="ghost" id="btn-plan">Dry-run plan</button>
+      </div>
+      <div class="hint">Examples: SP Flash Tool package (scatter), Qualcomm EDL package (rawprogram XML), Unisoc .pac, a single boot.img, a raw disk dump.</div>
+      <div id="fw-out"></div>
+    </div>
+  </section>
+
+  <!-- DUMP -->
+  <section id="tab-dump">
+    <div class="card">
+      <h2>Full-dump surgery</h2>
+      <p class="sub">Read a full-flash dump: partition table, what each partition contains, health warnings, and extraction with checksums.</p>
+      <div class="row">
+        <input type="text" id="dump-path" placeholder="/path/to/full_dump.bin" spellcheck="false">
+        <button class="primary" id="btn-dump">Analyse</button>
+        <button class="ghost" id="btn-scan">Signature scan</button>
+        <button class="ghost" id="btn-gpt">List partitions</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <input type="text" id="dump-out" placeholder="output folder for extraction (optional)" spellcheck="false">
+        <input type="text" id="dump-only" placeholder="only these partitions (comma separated, optional)" spellcheck="false">
+        <button class="ghost" id="btn-extract">Extract partitions</button>
+        <button class="ghost" id="btn-gpt-repair">Repair GPT (dry run)</button>
+      </div>
+      <div id="dump-out-area"></div>
+    </div>
+  </section>
+
+  <!-- TOOLS -->
+  <section id="tab-tools">
+    <div class="grid2">
+      <div class="card">
+        <h2>Convert / expand</h2>
+        <p class="sub">Sparse ↔ raw, LZ4 expansion, trimming zero tails, boot image extraction.</p>
+        <div class="row">
+          <input type="text" id="conv-path" placeholder="/path/to/image" spellcheck="false">
+        </div>
+        <div class="row" style="margin-top:10px">
+          <select id="conv-mode">
+            <option value="auto">auto (detect and do the right thing)</option>
+            <option value="raw">sparse → raw</option>
+            <option value="sparse">raw → sparse</option>
+            <option value="lz4">lz4 → raw</option>
+            <option value="trim">trim zero tail</option>
+            <option value="boot">extract boot image</option>
+          </select>
+          <button class="primary" id="btn-convert">Convert</button>
+        </div>
+        <div id="conv-out"></div>
+      </div>
+      <div class="card">
+        <h2>super.img (dynamic partitions)</h2>
+        <p class="sub">See what is inside a modern system image before you trust it.</p>
+        <div class="row">
+          <input type="text" id="super-path" placeholder="/path/to/super.img" spellcheck="false">
+        </div>
+        <div class="row" style="margin-top:10px">
+          <input type="text" id="super-part" placeholder="partition to extract (e.g. system_a)" spellcheck="false">
+          <button class="ghost" id="btn-super-list">List</button>
+          <button class="ghost" id="btn-super-extract">Extract</button>
+        </div>
+        <div id="super-out"></div>
+      </div>
+      <div class="card">
+        <h2>Backup integrity</h2>
+        <p class="sub">A backup you never verified is not a backup. Write a manifest of SHA-256 hashes, verify it later.</p>
+        <div class="row">
+          <input type="text" id="man-path" placeholder="/path/to/backup/folder" spellcheck="false">
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="btn-man-create">Create manifest</button>
+          <button class="ghost" id="btn-man-verify">Verify manifest</button>
+        </div>
+        <div id="man-out"></div>
+      </div>
+      <div class="card">
+        <h2>Sparse image verify</h2>
+        <p class="sub">Check a vendor sparse image's declared checksum against its actual contents - catches truncated downloads.</p>
+        <div class="row">
+          <input type="text" id="spv-path" placeholder="/path/to/system.img" spellcheck="false">
+          <button class="primary" id="btn-spv">Verify</button>
+        </div>
+        <div id="spv-out"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ERRORS -->
+  <section id="tab-errors">
+    <div class="card">
+      <h2>Error decoder</h2>
+      <p class="sub">Paste the tool's log or just the code (e.g. <code>2005</code>, <code>0xC0060001</code>, <code>STATUS_EXT_RAM_EXCEPTION</code>). You get what it means, why it happens, and what to do - in that order.</p>
+      <textarea id="err-text" placeholder="Paste the failing log line(s) here…"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" id="btn-err">Explain it</button>
+        <input type="text" id="err-search" placeholder="…or search all known codes" spellcheck="false">
+      </div>
+      <div id="err-out"></div>
+    </div>
+  </section>
+
+  <!-- GUIDE -->
+  <section id="tab-guide">
+    <div class="card">
+      <h2>Drivers and USB modes</h2>
+      <p class="sub">Nine out of ten "flashing tools don't see my phone" problems are here.</p>
+      <div id="guide-out">loading…</div>
+    </div>
+    <div class="card">
+      <h2>Safety rules Revive enforces</h2>
+      <div id="safety-out"></div>
+    </div>
+  </section>
+</main>
+
+<div id="jobs"></div>
+
+<script>
+const TOKEN = (typeof window.REVIVE_TOKEN === 'string' && window.REVIVE_TOKEN)
+  || new URLSearchParams(location.search).get('token') || '';
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const size = (n) => { if (n == null || isNaN(n)) return '?'; const u=['B','KB','MB','GB','TB']; let i=0, v=Number(n); while(v>=1024&&i<u.length-1){v/=1024;i++;} return (i===0? v+' '+u[0] : v.toFixed(2)+' '+u[i]); };
+const activeJobs = new Map();
+
+async function api(route, payload = {}, opts = {}) {
+  const res = await fetch('/api/call', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Revive-Token': TOKEN},
+    body: JSON.stringify({route, payload, sync: opts.sync !== false})
+  });
+  const data = await res.json().catch(() => ({ok:false, error:'invalid response'}));
+  if (data.job) return trackJob(data.job.id);
+  return data;
+}
+
+function trackJob(id) {
+  if (!activeJobs.has(id)) activeJobs.set(id, {id, progress:0, message:'queued', status:'running', route:''});
+  renderJobs();
+  const tick = async () => {
+    const res = await fetch('/api/job?id=' + encodeURIComponent(id), {headers:{'X-Revive-Token':TOKEN}});
+    const data = await res.json().catch(() => null);
+    if (!data || !data.job) return null;
+    activeJobs.set(id, data.job);
+    renderJobs();
+    if (data.job.status === 'running' || data.job.status === 'queued') { setTimeout(tick, 700); return null; }
+    return data.job;
+  };
+  return new Promise(resolve => {
+    const loop = async () => {
+      const job = await tick();
+      if (job) { activeJobs.set(id, job); renderJobs(); resolve(job.result || {ok:false, error:job.error}); }
+      else loop();
+    };
+    loop();
+  });
+}
+
+function renderJobs() {
+  const box = $('jobs'); const jobs = [...activeJobs.values()];
+  if (!jobs.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  box.style.display = 'block';
+  box.innerHTML = '<h2 style="margin:0 0 8px;font-size:14px">Jobs</h2>' + jobs.map(j => `
+    <div style="margin-bottom:10px">
+      <div class="row" style="justify-content:space-between"><b style="font-size:12.5px">${esc(j.route)}</b>
+        <span class="badge ${j.status==='done'?'live':''}">${esc(j.status)}</span></div>
+      <div class="bar"><i style="width:${Math.round((j.progress||0)*100)}%"></i></div>
+      <div class="muted" style="font-size:12px">${esc(j.message || j.error || '')}</div>
+    </div>`).join('');
+}
+
+/* ---------- renderers ---------- */
+function findings(list) {
+  if (!list || !list.length) return '';
+  return '<ul class="findings">' + list.map(f => `
+    <li class="finding ${esc(f.severity)}">
+      <b>${esc(f.title)}</b>
+      ${f.detail ? `<div class="muted">${esc(f.detail)}</div>` : ''}
+      ${(f.fixes||[]).length ? `<ul class="fix">${f.fixes.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+      ${f.code ? `<div class="hint">code: <code>${esc(f.code)}</code>${f.where?` · ${esc(f.where)}`:''}</div>` : ''}
+    </li>`).join('') + '</ul>';
+}
+function kv(obj, skip = []) {
+  if (!obj) return '';
+  return '<div class="kv">' + Object.entries(obj).filter(([k,v]) => !skip.includes(k) && v !== '' && v != null)
+    .map(([k,v]) => `<div>${esc(k.replace(/_/g,' '))}</div><div class="mono">${esc(typeof v === 'object' ? JSON.stringify(v) : v)}</div>`).join('') + '</div>';
+}
+function table(cols, rows) {
+  if (!rows || !rows.length) return '<p class="muted">nothing to show</p>';
+  return '<div class="scroll"><table><tr>' + cols.map(c => `<th>${esc(c.label)}</th>`).join('') + '</tr>' +
+    rows.map(r => '<tr>' + cols.map(c => `<td class="${c.mono?'mono':''}">${c.render ? c.render(r) : esc(r[c.key])}</td>`).join('') + '</tr>').join('') +
+    '</table></div>';
+}
+function errbox(data) {
+  if (!data) return '';
+  if (data.ok !== false) return '';
+  return `<div class="finding error"><b>${esc(data.error || 'operation failed')}</b>
+    ${data.detail ? `<div class="muted">${esc(data.detail)}</div>` : ''}
+    ${data.explanation ? `<div class="muted">${esc(data.explanation.meaning || '')}</div>` : ''}</div>`;
+}
+
+/* ---------- actions ---------- */
+async function detect() {
+  const out = $('detect-out'); out.innerHTML = '<p class="muted">scanning USB…</p>';
+  const data = await api('detect', {});
+  let html = '';
+  if (data.devices && data.devices.length) {
+    html += table([
+      {label:'USB id', key:'id', mono:true}, {label:'Mode', render: r => esc(r.label)},
+      {label:'Backend', key:'backend', mono:true}, {label:'Device', render: r => esc(r.product || r.manufacturer || '')}
+    ], data.devices);
+    html += '<div style="margin-top:12px"><h3 style="font-size:14px">What to do next</h3><ol>' +
+      (data.suggested_actions||[]).map(a => `<li>${esc(a)}</li>`).join('') + '</ol></div>';
+  } else { html += '<p class="muted">No phone detected on USB.</p>'; }
+  (data.warnings||[]).forEach(w => html += `<div class="finding warn"><b>USB note</b><div class="muted">${esc(w)}</div></div>`);
+  if ((data.suggested_actions||[]).length && !(data.devices||[]).length) {
+    html += '<ol>' + data.suggested_actions.map(a => `<li>${esc(a)}</li>`).join('') + '</ol>';
+  }
+  out.innerHTML = html;
+}
+
+async function identify() {
+  const out = $('detect-out');
+  out.innerHTML = '<p class="muted">opening device…</p>';
+  const demo = $('chk-demo').checked;
+  const data = await api('identify', demo ? {backend:'mock'} : {});
+  if (!data.ok) { out.innerHTML = errbox(data) + '<p class="muted">Tip: leave the simulated-device box ticked to explore the workflow.</p>'; return; }
+  const d = data.device;
+  out.innerHTML = `<div class="card" style="margin:12px 0 0">
+      <h2>${esc(d.chip || 'Device')} <span class="pill">${esc(data.backend)}</span></h2>
+      ${kv({hwcode:d.hwcode, chip_confidence:d.chip_confidence, storage:d.storage,
+            capacity: size(d.storage_size), mode:d.mode, usb_id:d.usb_id, serial:d.serial,
+            security: d.security, extras: d.extras})}
+      ${(d.notes||[]).length ? '<ul>' + d.notes.map(n=>`<li>${esc(n)}</li>`).join('') + '</ul>' : ''}
+    </div>`;
+}
+
+async function inspectFirmware() {
+  const out = $('fw-out'); const path = $('fw-path').value.trim();
+  if (!path) { out.innerHTML = '<p class="muted">Enter a folder or file path.</p>'; return; }
+  out.innerHTML = '<p class="muted">reading package…</p>';
+  const data = await api('inspect', {path});
+  if (!data.ok) { out.innerHTML = errbox(data); return; }
+  let html = `<div class="card" style="margin:12px 0"><h2>${esc(data.label)}</h2>
+    ${kv({kind:data.kind, platform:data.platform, storage:data.storage,
+          images:(data.images||[]).length, total:size(data.total_size),
+          scatter:data.scatter, loaders:(data.loaders||[]).join(', '),
+          da_files:(data.da_files||[]).join(', '), ok_to_flash:data.ok_to_flash})}</div>`;
+  html += findings(data.findings);
+  if ((data.images_detail||[]).length) {
+    html += '<h3 style="font-size:14px">Contents</h3>' + table([
+      {label:'file', key:'name', mono:true}, {label:'size', render:r=>esc(size(r.size))},
+      {label:'detected', render:r=>esc(r.detected || r.kind || '')},
+      {label:'detail', render:r=>esc((r.filesystem && r.filesystem.label) || (r.boot && r.boot.kind) || (r.super && (r.super.partition_count+' partitions')) || '')}
+    ], data.images_detail);
+  }
+  out.innerHTML = html;
+}
+
+async function planFirmware() {
+  const out = $('fw-out'); const path = $('fw-path').value.trim();
+  if (!path) { out.innerHTML = '<p class="muted">Enter a folder or file path.</p>'; return; }
+  out.innerHTML = '<p class="muted">building dry-run plan…</p>';
+  const data = await api('plan', {path});
+  if (!data.ok) { out.innerHTML = errbox(data); return; }
+  let html = `<div class="card" style="margin:12px 0">
+    <h2>Dry-run flash plan <span class="risk ${esc(data.risk)}">${esc(data.risk)}</span></h2>
+    <p class="sub">${esc((data.risk_reasons||[]).join(' · '))}</p>
+    ${kv({package:data.root, type:data.kind, total:size(data.total_bytes),
+          writes:(data.entries||[]).filter(e=>e.action==='write').length,
+          safe_to_proceed:data.ok_to_proceed})}
+    ${(data.backup_targets||[]).length ? `<p><b>Back these up first:</b> <code>${esc(data.backup_targets.join(', '))}</code></p>` : ''}
+  </div>`;
+  html += findings(data.findings);
+  html += '<h3 style="font-size:14px">Entries</h3>' + table([
+    {label:'partition', key:'name'}, {label:'action', key:'action'},
+    {label:'size', render:r=>esc(size(r.source_size))},
+    {label:'target', render:r=>esc(size(r.target_size))},
+    {label:'file', key:'source', mono:true},
+    {label:'critical', render:r=>r.critical?'yes':''}, {label:'notes', key:'notes'}
+  ], data.entries);
+  out.innerHTML = html;
+}
+
+async function dumpAction(which) {
+  const out = $('dump-out-area'); const path = $('dump-path').value.trim();
+  if (!path) { out.innerHTML = '<p class="muted">Enter the dump file path.</p>'; return; }
+  out.innerHTML = '<p class="muted">working…</p>';
+  if (which === 'analyse') {
+    const data = await api('dump.analyse', {path});
+    if (!data.ok) { out.innerHTML = errbox(data); return; }
+    let html = `<div class="card" style="margin:12px 0"><h2>Dump report</h2>
+      ${kv({file:data.path, size:size(data.file_size), gpt_offset:data.gpt_offset,
+            header_crc_ok:data.header_crc_ok, entries_crc_ok:data.entries_crc_ok,
+            partitions:data.partition_count, unaccounted:size(data.unaccounted)})}</div>`;
+    html += findings(data.findings);
+    html += '<h3 style="font-size:14px">Partitions</h3>' + table([
+      {label:'name', key:'name'}, {label:'offset', render:r=>'0x'+Number(r.offset).toString(16), mono:true},
+      {label:'size', render:r=>esc(r.size_human)},
+      {label:'content', render:r=>esc(r.kind + (r.detail ? ' · '+r.detail : ''))},
+      {label:'filesystem', render:r=>esc(r.fs_label || '')},
+      {label:'issues', render:r=>esc((r.issues||[]).join(', '))}
+    ], data.partitions);
+    out.innerHTML = html;
+  } else if (which === 'scan') {
+    const data = await api('dump.scan', {path});
+    out.innerHTML = `<h3 style="font-size:14px">Signature scan (${data.count||0} hits)</h3>` + table([
+      {label:'offset', key:'offset_hex', mono:true}, {label:'what', key:'kind'},
+      {label:'aligned', render:r=>r.aligned?'yes':'no'}
+    ], data.hits || []);
+  } else if (which === 'gpt') {
+    const data = await api('gpt.list', {path});
+    if (!data.ok) { out.innerHTML = errbox(data); return; }
+    out.innerHTML = kv({gpt_offset:data.disk_offset, sector_size:data.sector_size,
+      crc_ok:data.header_crc_ok + ' / ' + data.entries_crc_ok, backup_used:data.backup_used,
+      disk_guid:data.disk_guid, partitions:data.partition_count}) +
+      table([{label:'name', key:'name'},{label:'start LBA', key:'first_lba'},
+             {label:'size', render:r=>esc(size(r.size))},{label:'type', key:'type_name'}], data.partitions);
+  } else if (which === 'extract') {
+    const payload = {path};
+    const outdir = $('dump-out').value.trim(); const only = $('dump-only').value.trim();
+    if (outdir) payload.out = outdir;
+    if (only) payload.only = only;
+    const data = await api('dump.extract', payload, {sync:false});
+    if (!data.ok) { out.innerHTML = errbox(data); return; }
+    out.innerHTML = `<div class="finding ok"><b>Extracted ${data.partitions} partitions</b>
+      <div class="muted">${esc(data.manifest)} · ${esc(size(data.total_size))}</div></div>
+      <div class="hint">A manifest with SHA-256 per file was written next to the images. Verify it any time with the File tools tab.</div>`;
+  } else if (which === 'repair') {
+    const data = await api('gpt.repair', {path});
+    out.innerHTML = kv(data, ['ok','changes']) + '<ul>' + (data.changes||[]).map(c=>`<li>${esc(c)}</li>`).join('') + '</ul>' +
+      '<div class="hint">Dry run only. Add <code>apply</code> from the CLI to write the repair: <code>revive gpt-repair &lt;dump&gt; --apply</code></div>';
+  }
+}
+
+async function convertFile() {
+  const out = $('conv-out'); const path = $('conv-path').value.trim(); const mode = $('conv-mode').value;
+  if (!path) { out.innerHTML = '<p class="muted">Enter a file path.</p>'; return; }
+  out.innerHTML = '<p class="muted">converting…</p>';
+  const data = await api('convert', {path, mode}, {sync:false});
+  out.innerHTML = data.ok === false ? errbox(data) : kv(data, ['ok']);
+}
+async function superAction(which) {
+  const out = $('super-out'); const path = $('super-path').value.trim();
+  if (!path) { out.innerHTML = '<p class="muted">Enter a super.img path.</p>'; return; }
+  out.innerHTML = '<p class="muted">reading…</p>';
+  if (which === 'list') {
+    const data = await api('super.list', {path});
+    if (!data.ok) { out.innerHTML = errbox(data); return; }
+    out.innerHTML = kv({version:data.version, slot_count:data.slot_count,
+        partition_count:data.partition_count, total:size(data.total_size), notes:(data.notes||[]).join(' ')}) +
+      table([{label:'partition', key:'name'},{label:'size', render:r=>esc(r.size_human)},
+             {label:'group', key:'group'},{label:'extents', render:r=>esc((r.extents||[]).length)}], data.partitions);
+  } else {
+    const data = await api('super.extract', {path, partition: $('super-part').value.trim()}, {sync:false});
+    out.innerHTML = data.ok === false ? errbox(data) : kv(data, ['ok']);
+  }
+}
+async function manifest(which) {
+  const out = $('man-out'); const path = $('man-path').value.trim();
+  if (!path) { out.innerHTML = '<p class="muted">Enter a folder path.</p>'; return; }
+  out.innerHTML = '<p class="muted">hashing files…</p>';
+  const data = which === 'create' ? await api('manifest.create', {path}, {sync:false})
+                                  : await api('manifest.verify', {path}, {sync:false});
+  if (data.ok === false && !data.verified) { out.innerHTML = errbox(data); return; }
+  let html = kv(data, ['ok','findings']);
+  if (data.findings) html += findings(data.findings);
+  if (data.mismatched && data.mismatched.length) html += table([{label:'file',key:'path'},
+      {label:'expected',key:'expected',mono:true},{label:'actual',key:'actual',mono:true}], data.mismatched);
+  out.innerHTML = html;
+}
+async function sparseVerify() {
+  const out = $('spv-out'); const path = $('spv-path').value.trim();
+  if (!path) { out.innerHTML = '<p class="muted">Enter an image path.</p>'; return; }
+  out.innerHTML = '<p class="muted">verifying…</p>';
+  const data = await api('sparse.verify', {path}, {sync:false});
+  out.innerHTML = kv(data, ['ok']);
+}
+async function explainError() {
+  const out = $('err-out'); const text = $('err-text').value.trim() || $('err-search').value.trim();
+  if (!text) { out.innerHTML = '<p class="muted">Paste a log line or a code.</p>'; return; }
+  const data = await api('errors.decode', {text});
+  if (!data.matched) {
+    out.innerHTML = `<div class="finding warn"><b>Not in the table yet</b>
+      <div class="muted">${esc(data.note || '')}</div>
+      <ul class="fix">${(data.advice||[]).map(a=>`<li>${esc(a)}</li>`).join('')}</ul></div>`;
+    return;
+  }
+  const e = data.error;
+  out.innerHTML = `<div class="finding ${e.severity}">
+      <b>${esc(e.code)} ${esc(e.symbol)}</b>
+      <div>${esc(e.meaning)}</div>
+    </div>
+    <div class="grid2"><div class="card"><h2>Why it happens</h2><ol>${e.causes.map(c=>`<li>${esc(c)}</li>`).join('')}</ol></div>
+    <div class="card"><h2>What to do</h2><ol>${e.fixes.map(f=>`<li>${esc(f)}</li>`).join('')}</ol></div></div>
+    <div class="card"><h2>Then follow this</h2><ol>${(data.advice||[]).map(a=>`<li>${esc(a)}</li>`).join('')}</ol></div>`;
+}
+async function searchErrors() {
+  const out = $('err-out'); const q = $('err-search').value.trim();
+  const data = await api('errors', {q});
+  out.innerHTML = '<h3 style="font-size:14px">' + (data.count||0) + ' codes</h3>' + table([
+    {label:'code', key:'code', mono:true},{label:'symbol', key:'symbol', mono:true},
+    {label:'when', key:'phase'},{label:'means', key:'meaning'}], data.errors);
+}
+async function loadGuide() {
+  const data = await api('drivers', {});
+  let html = `<h2>${esc(data.summary || '')}</h2><ol>` + (data.steps||[]).map(s=>`<li>${esc(s)}</li>`).join('') + '</ol>';
+  if (data.where_to_get) html += '<h3 style="font-size:14px">Where to get the files</h3><ul>' + data.where_to_get.map(s=>`<li>${esc(s)}</li>`).join('') + '</ul>';
+  if (data.udev_rules) html += `<h3 style="font-size:14px">udev rule (Linux)</h3><p class="muted">Save as <code>${esc(data.udev_rule_path||'/etc/udev/rules.d/99-revive.rules')}</code> then run <code>sudo udevadm control --reload-rules &amp;&amp; sudo udevadm trigger</code></p><pre>${esc(data.udev_rules)}</pre>`;
+  html += '<h3 style="font-size:14px">Universal rules</h3><ul>' + (data.universal_tips||[]).map(t=>`<li>${esc(t)}</li>`).join('') + '</ul>';
+  $('guide-out').innerHTML = html;
+
+  const modes = await api('modes', {});
+  $('safety-out').innerHTML = `
+    <ul>
+      <li>Nothing is written to a device without a validated plan and an explicit confirmation.</li>
+      <li>A preloader or partition-table write is always flagged as high risk in the plan.</li>
+      <li>Revive never guesses an unknown chip's programming parameters.</li>
+      <li>Backups get a SHA-256 manifest so you can prove they are intact.</li>
+      <li>IMEI rewriting is not implemented: it is illegal in most countries, including Pakistan.</li>
+      <li>Use this on devices you own or are authorised to repair.</li>
+    </ul>
+    <h3 style="font-size:14px">Modes Revive recognises</h3>` +
+    table([{label:'mode', key:'label'},{label:'vendor', key:'vendor'},{label:'backend', key:'backend'},
+           {label:'flashable', render:r=>r.flashable?'yes':'no'},{label:'what it means', key:'description'}],
+          modes.modes);
+}
+
+async function buildDemo() {
+  const box = $('jobs');
+  activeJobs.set('demo', {id:'demo', route:'demo.build', progress:0, message:'creating demo data…', status:'running'});
+  renderJobs();
+  const data = await api('demo.build', {}, {sync:false});
+  activeJobs.set('demo', {id:'demo', route:'demo.build', progress:1, message:data.ok?'done':'failed', status:data.ok?'done':'failed'});
+  renderJobs();
+  if (data.ok) {
+    $('fw-path').value = data.paths.firmware_mtk.root;
+    $('dump-path').value = data.paths.dump;
+    detect();
+    alert('Demo data created in ' + data.paths.out + '\n\nThe Firmware and Dump fields are now filled in.');
+  } else { alert(data.error || 'could not create demo data'); }
+}
+
+/* ---------- wiring ---------- */
+document.querySelectorAll('nav button').forEach(btn => btn.onclick = () => {
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b === btn));
+  document.querySelectorAll('section').forEach(s => s.classList.toggle('active', s.id === 'tab-' + btn.dataset.tab));
+});
+$('btn-detect').onclick = detect;
+$('btn-identify').onclick = identify;
+$('btn-inspect').onclick = inspectFirmware;
+$('btn-plan').onclick = planFirmware;
+$('btn-dump').onclick = () => dumpAction('analyse');
+$('btn-scan').onclick = () => dumpAction('scan');
+$('btn-gpt').onclick = () => dumpAction('gpt');
+$('btn-extract').onclick = () => dumpAction('extract');
+$('btn-gpt-repair').onclick = () => dumpAction('repair');
+$('btn-convert').onclick = convertFile;
+$('btn-super-list').onclick = () => superAction('list');
+$('btn-super-extract').onclick = () => superAction('extract');
+$('btn-man-create').onclick = () => manifest('create');
+$('btn-man-verify').onclick = () => manifest('verify');
+$('btn-spv').onclick = sparseVerify;
+$('btn-err').onclick = explainError;
+$('err-search').onkeydown = (e) => { if (e.key === 'Enter') searchErrors(); };
+$('btn-demo').onclick = buildDemo;
+
+(async function boot() {
+  const info = await api('info', {});
+  $('version').textContent = 'v' + (info.version || '?') + ' · py' + (info.python || '?');
+  $('mode-badge').textContent = info.demo ? 'DEMO MODE' : 'ready';
+  $('mode-badge').className = 'badge ' + (info.demo ? 'demo' : 'live');
+  $('usb-badge').textContent = info.libusb ? 'USB ready' : 'USB off (files still work)';
+  $('usb-badge').title = info.libusb ? '' : 'Install with: ' + info.install_hint;
+  if (!TOKEN) {
+    document.body.insertAdjacentHTML('afterbegin',
+      '<div style="background:#33121f;padding:10px 18px">No session token in the URL. Open the exact link printed by <code>revive serve</code>.</div>');
+  }
+  detect();
+  loadGuide();
+})();
+</script>
+</body>
+</html>

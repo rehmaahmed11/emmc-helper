@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "revive"
+version = "0.1.0"
+description = "Revive - a repair-first toolkit for dead and bricked phones (MediaTek, Qualcomm, Unisoc, Rockchip, Allwinner)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "emmc-helper contributors" }]
+keywords = ["mediatek", "qualcomm", "edl", "brom", "flashing", "unbrick", "emmc", "ufs"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Hardware",
+]
+dependencies = []
+
+[project.optional-dependencies]
+usb = ["pyusb>=1.2.1"]
+serial = ["pyserial>=3.5"]
+fast = ["lz4>=4.0"]
+full = ["pyusb>=1.2.1", "pyserial>=3.5", "lz4>=4.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+revive = "revive.cli:main"
+
+[tool.setuptools]
+packages = ["revive", "revive.core", "revive.storage", "revive.firmware", "revive.ops", "revive.backends", "revive.ui"]
+
+[tool.setuptools.package-data]
+"revive.ui" = ["static/*"]
+"revive" = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
