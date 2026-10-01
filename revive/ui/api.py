@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .. import util
-from ..backends import describe_backends, get_backend
+from ..backends import describe_backends, get_backend, intercept_and_capture
 from ..core import chips, errors, usbmodes
 from ..firmware import detect as fw_detect
-from ..ops import convert, dump, plan, verify
+from ..ops import convert, dossier, dump, plan, verify
 from ..storage import bootimg, ext4fs, gpt, lz4blk, magic, sparse, superimg
 
 
@@ -127,9 +127,27 @@ def identify(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     try:
         backend.open()
         info_obj = backend.identify()
-        return {"ok": True, "backend": backend_name, "device": info_obj.to_dict(),
-                "capabilities": backend.capabilities(), "log": backend.log,
-                "warnings": backend.guard_tested()}
+        out_dir = payload.get("out")
+        dossier_info = None
+        if out_dir:
+            parts = []
+            try:
+                parts = backend.list_partitions()
+            except Exception:
+                parts = []
+            dossier_info = dossier.save_device_dossier(
+                out_dir=out_dir,
+                device_info=info_obj,
+                intercept_result=getattr(backend, "intercept_result", None),
+                partitions=parts,
+                backend_log=backend.log,
+            )
+        res = {"ok": True, "backend": backend_name, "device": info_obj.to_dict(),
+               "capabilities": backend.capabilities(), "log": backend.log,
+               "warnings": backend.guard_tested()}
+        if dossier_info:
+            res["dossier"] = dossier_info
+        return res
     except Exception as exc:
         return _error(exc)
     finally:
@@ -137,6 +155,30 @@ def identify(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
             backend.close()
         except Exception:
             pass
+
+
+def intercept(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the sub-ms handshake interceptor + force-entry engine and build the device dossier."""
+    backend_name = str(payload.get("backend") or "auto").strip()
+    demo_mode = bool(ctx.get("demo") or payload.get("demo") or backend_name == "mock")
+    out_dir = payload.get("out", dossier.DEFAULT_DOSSIER_DIR)
+    if payload.get("no_save"):
+        out_dir = None
+    return intercept_and_capture(
+        backend_name=backend_name,
+        timeout=float(payload.get("timeout", 15.0)),
+        force_entry=bool(payload.get("force", True)),
+        force_brom=bool(payload.get("force_brom", False)),
+        out_dir=out_dir,
+        demo=demo_mode,
+        storage_path=ctx.get("demo_storage"),
+    )
+
+
+def dossier_list(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """List all connected/handshaked devices recorded in the dossier folder."""
+    out_dir = payload.get("out") or payload.get("path") or dossier.DEFAULT_DOSSIER_DIR
+    return dossier.list_dossiers(out_dir)
 
 
 # --------------------------------------------------------------------------------------
@@ -363,6 +405,8 @@ ROUTES: Dict[str, Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = 
     "drivers": drivers,
     "detect": detect,
     "identify": identify,
+    "intercept": intercept,
+    "dossier.list": dossier_list,
     "inspect": inspect,
     "plan": plan_flash,
     "dump.analyse": dump_analyse,
@@ -381,7 +425,7 @@ ROUTES: Dict[str, Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = 
 
 # Routes that touch the filesystem or a device - the UI asks for confirmation on these.
 MUTATING = {"dump.extract", "gpt.repair", "convert", "super.extract", "manifest.create",
-            "demo.build"}
+            "demo.build", "intercept"}
 
 
 def dispatch(route: str, payload: Optional[Dict[str, Any]] = None,

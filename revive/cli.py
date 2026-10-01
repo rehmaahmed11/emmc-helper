@@ -15,10 +15,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import util
-from .backends import describe_backends, get_backend
+from .backends import describe_backends, get_backend, intercept_and_capture
 from .core import chips, errors, usbmodes
 from .firmware import detect as fw_detect
-from .ops import convert, dump, plan as plan_mod, verify
+from .ops import convert, dossier, dump, plan as plan_mod, verify
 from .storage import bootimg, gpt, magic, sparse, superimg
 from .util import human_size
 
@@ -118,8 +118,26 @@ def cmd_detect(args) -> int:
     from .backends import detect as backend_detect
 
     result = backend_detect()
+    payload = result.to_dict()
+    if getattr(args, "out", None) and result.devices:
+        saved = []
+        for dev in result.devices:
+            dev_info = util.to_dict(dev)
+            from .backends.base import DeviceInfo
+
+            dinfo = DeviceInfo(
+                backend=str(dev.get("backend") or ""),
+                mode=str(dev.get("mode") or ""),
+                vendor=str(dev.get("manufacturer") or ""),
+                usb_id=str(dev.get("id") or ""),
+                serial=str(dev.get("serial") or ""),
+            )
+            saved.append(dossier.save_device_dossier(
+                out_dir=args.out, device_info=dinfo, extra_devices=result.devices
+            ))
+        payload["dossiers"] = saved
     if args.json:
-        print(json.dumps(result.to_dict(), indent=2))
+        print(json.dumps(payload, indent=2))
         return 0
     if not result.devices:
         print(C("No phone detected on USB.", "yellow"))
@@ -136,9 +154,63 @@ def cmd_detect(args) -> int:
         print("\nSerial/COM ports that may be download interfaces:")
         for port in result.serial_ports:
             print(f"    {port['port']:<16} {port['description'][:50]:<50} {port.get('likely','')}")
+    if payload.get("dossiers"):
+        print(f"\nSaved {len(payload['dossiers'])} device dossier(s) to {args.out}")
     print("\nNext steps:")
     for step in result.suggested_actions:
         print(f"  - {step}")
+    return 0
+
+
+def cmd_intercept(args) -> int:
+    out_dir = None if getattr(args, "no_save", False) else (args.out or dossier.DEFAULT_DOSSIER_DIR)
+    res = intercept_and_capture(
+        backend_name=args.backend or "auto",
+        timeout=args.timeout,
+        force_entry=not getattr(args, "no_force", False),
+        force_brom=bool(getattr(args, "force_brom", False)),
+        out_dir=out_dir,
+        demo=bool(getattr(args, "demo", False)),
+        storage_path=Path(args.storage) if getattr(args, "storage", None) else None,
+        verbose=bool(getattr(args, "verbose", False)),
+    )
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("ok") else 1
+    if not res.get("ok"):
+        inter = res.get("interception") or {}
+        if inter.get("usb_bounces"):
+            print(C(f"Detected {len(inter['usb_bounces'])} kernel USB contact bounce(s):", "yellow"),
+                  file=sys.stderr)
+            for b in inter["usb_bounces"][:5]:
+                print(f"  ! {b.get('raw')}", file=sys.stderr)
+        return fail(str(res.get("error") or "Interception timed out"), code="no_device")
+
+    inter = res["interception"]
+    dev = res["device"]
+    dos = res.get("dossier") or {}
+    print(f"{C('HANDSHAKE LOCKED', 'green')}  {C(dev.get('chip') or inter.get('usb_id'), 'bold')}  "
+          f"[{inter.get('mode')}]")
+    print_kv({
+        "usb_id": inter.get("usb_id"),
+        "capture_latency_ms": inter.get("capture_latency_ms"),
+        "handshake_duration_ms": inter.get("handshake_duration_ms"),
+        "wdt_disabled": inter.get("wdt_disabled"),
+        "wdt_address": inter.get("wdt_address"),
+        "forced_from_mode": inter.get("forced_from_mode") or "direct catch",
+        "preloader_crashed_to_brom": inter.get("preloader_crashed_to_brom"),
+        "chip": dev.get("chip"),
+        "hwcode": dev.get("hwcode"),
+        "security": dev.get("security"),
+    }, "  ")
+    if dos.get("dossier_dir"):
+        print(f"\n  {C('Device Handshake & Scatter Folder Created:', 'bold')}")
+        print(f"    Folder     : {dos['dossier_dir']}")
+        print(f"    Scatter    : {dos['scatter_file']}")
+        print(f"    Rawprogram : {dos['rawprogram_file']}")
+        print(f"    Trace      : {dos['handshake_trace_file']}")
+        print(f"    Checklist  : {dos['recovery_checklist_file']}")
+        print(f"    Master Idx : {dos['index_file']}")
     return 0
 
 
@@ -147,16 +219,29 @@ def cmd_identify(args) -> int:
     if not backend_name:
         if args.demo:
             backend_name = "mock"
+        elif getattr(args, "wait", False) or getattr(args, "force", False) or getattr(args, "force_brom", False):
+            backend_name = "mtk"
         else:
             from .backends import detect as backend_detect
 
             backend_name = backend_detect().suggested_backend or ""
             if not backend_name:
-                return fail("no device detected; pass --backend or plug a phone in",
+                return fail("no device detected; pass --backend, --wait/--force, or plug a phone in",
                             code="no_device")
     kwargs: Dict[str, Any] = {}
     if backend_name == "mock":
         kwargs["storage_path"] = Path(args.storage) if args.storage else None
+    elif backend_name in ("mtk", "qualcomm", "unisoc"):
+        if getattr(args, "timeout", None):
+            kwargs["timeout"] = float(args.timeout)
+        if getattr(args, "wait", False):
+            kwargs["wait"] = True
+        if getattr(args, "force", False):
+            kwargs["force_entry"] = True
+            kwargs["wait"] = True
+        if getattr(args, "force_brom", False) and backend_name == "mtk":
+            kwargs["force_brom"] = True
+            kwargs["wait"] = True
     backend = get_backend(backend_name, **kwargs)
     try:
         backend.open()
@@ -164,15 +249,38 @@ def cmd_identify(args) -> int:
         if args.loader and hasattr(backend, "upload_loader"):
             backend.upload_loader(args.loader)
             info = backend.identify()
+        parts = []
+        try:
+            parts = backend.list_partitions()
+        except Exception:
+            parts = []
+        dossier_info = None
+        out_dir = getattr(args, "out", None)
+        if out_dir:
+            dossier_info = dossier.save_device_dossier(
+                out_dir=out_dir,
+                device_info=info,
+                intercept_result=getattr(backend, "intercept_result", None),
+                partitions=parts,
+                backend_log=backend.log,
+            )
         if args.json:
-            print(json.dumps({"device": info.to_dict(),
-                              "capabilities": backend.capabilities(),
-                              "log": backend.log}, indent=2))
+            pay: Dict[str, Any] = {
+                "device": info.to_dict(),
+                "capabilities": backend.capabilities(),
+                "log": backend.log,
+            }
+            if dossier_info:
+                pay["dossier"] = dossier_info
+            print(json.dumps(pay, indent=2))
             return 0
         print(f"{C(info.chip or 'Device', 'bold')}  ({backend.label})")
         print_kv(info.to_dict(), "  ")
         for note in info.notes:
             print(C(f"  note: {note}", "yellow"))
+        if dossier_info:
+            print(f"\n  Saved handshake & scatter dossier to: {dossier_info['dossier_dir']}")
+            print(f"    scatter: {dossier_info['scatter_file']}")
         return 0
     except Exception as exc:
         return fail(str(exc), code=getattr(exc, "code", ""),
@@ -620,13 +728,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_info)
 
     p = sub.add_parser("detect", help="what is connected, and what to do next")
+    p.add_argument("--out", help="save a handshake/device dossier folder for each connected device")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_detect)
+
+    p = sub.add_parser("intercept",
+                       help="sub-ms handshake interceptor + force BROM/EDL entry + auto scatter dossier")
+    p.add_argument("--backend", default="auto",
+                   choices=["auto", "mtk", "qualcomm", "unisoc", "fastboot", "mock"])
+    p.add_argument("--timeout", type=float, default=20.0, help="seconds to spin-wait for handshake")
+    p.add_argument("--force", action="store_true", default=True,
+                   help="force mode transition from ADB/Fastboot/Diag & reset stuck USB ports")
+    p.add_argument("--no-force", action="store_true",
+                   help="disable active ADB/Fastboot/Diag escalation")
+    p.add_argument("--force-brom", action="store_true",
+                   help="if caught in MediaTek Preloader (battery attached), crash it into BROM 0e8d:0003")
+    p.add_argument("--out", default=dossier.DEFAULT_DOSSIER_DIR,
+                   help="folder to save all connected handshakes, scatter & device details")
+    p.add_argument("--no-save", action="store_true", help="do not write the handshake dossier folder")
+    p.add_argument("--storage", help="storage file for the simulated backend")
+    p.add_argument("--demo", action="store_true", help="use the simulated device")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_intercept)
 
     p = sub.add_parser("identify", help="read chip / security / storage from a device")
     p.add_argument("--backend", choices=["mtk", "qualcomm", "unisoc", "fastboot", "mock"])
     p.add_argument("--loader", help="firehose loader to upload first (Qualcomm)")
     p.add_argument("--storage", help="storage file for the simulated backend")
+    p.add_argument("--wait", action="store_true", help="spin-wait for sub-ms BROM/EDL window")
+    p.add_argument("--force", action="store_true", help="force ADB/Fastboot/Diag into BROM/EDL")
+    p.add_argument("--force-brom", action="store_true",
+                   help="crash MediaTek Preloader into BROM (works with battery attached)")
+    p.add_argument("--timeout", type=float, default=15.0)
+    p.add_argument("--out", help="save handshake, scatter & device details to this folder")
     p.add_argument("--demo", action="store_true", help="use the simulated device")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_identify)
