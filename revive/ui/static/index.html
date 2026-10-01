@@ -84,6 +84,7 @@
   <button data-tab="tools">File tools</button>
   <button data-tab="errors">Error decoder</button>
   <button data-tab="guide">Guide</button>
+  <button data-tab="lab">LAB TESTING</button>
 </nav>
 
 <main>
@@ -232,6 +233,66 @@
     <div class="card">
       <h2>Safety rules Revive enforces</h2>
       <div id="safety-out"></div>
+    </div>
+  </section>
+
+  <!-- LAB TESTING -->
+  <section id="tab-lab">
+    <div class="card">
+      <h2>LAB TESTING &mdash; virtual device laboratory</h2>
+      <p class="sub">Create virtual phones, break them, run Revive's repair logic against them and verify that they came back. Nothing here touches hardware: the diagnosis is the same code Revive runs on a real phone, pointed at a simulated eMMC.</p>
+      <div class="row">
+        <select id="lab-chip" title="chipset profile"></select>
+        <input type="text" id="lab-storage" value="64GB" style="flex:0 1 110px" spellcheck="false" title="nominal capacity">
+        <button class="primary" id="btn-lab-create">Create device</button>
+        <button class="ghost" id="btn-lab-refresh">Refresh</button>
+        <select id="lab-device" title="active device"></select>
+        <button class="ghost" id="btn-lab-delete" title="delete the selected virtual device">Delete device</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input type="text" id="lab-manufacturer" placeholder="manufacturer, e.g. Micron" style="flex:0 1 180px" spellcheck="false" title="the CID maker">
+        <select id="lab-health" title="eMMC health (PRE_EOL_INFO)">
+          <option value="">health: leave as is</option>
+          <option value="healthy">healthy (0x01)</option>
+          <option value="warning">warning (0x02)</option>
+          <option value="dead">dead (0x03)</option>
+        </select>
+        <input type="text" id="lab-firmware" placeholder="firmware version" style="flex:0 1 160px" spellcheck="false" title="EXT_CSD FIRMWARE_VERSION">
+        <button class="ghost" id="btn-lab-chip" title="apply the chip settings above to the active device">Apply chip settings</button>
+      </div>
+      <p class="sub">Manufacturer, size, health and firmware version are used when the device is created, and can be changed afterwards with <i>Apply chip settings</i>.</p>
+      <div id="lab-status" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Testing &mdash; brick the active device</h2>
+      <p class="sub">One click per fault. Each one declares the signals Revive's diagnosis engine is then expected to find.</p>
+      <div class="row" id="lab-bricks"></div>
+      <div class="row" style="margin-top:8px">
+        <input type="text" id="lab-opt" placeholder="scenario option, e.g. mode=total or health=dead" style="flex:0 1 300px" spellcheck="false">
+      </div>
+      <div id="lab-brick-out"></div>
+    </div>
+
+    <div class="card">
+      <h2>Recovery</h2>
+      <p class="sub">Run Revive: diagnose the fault, repair it, then verify the device actually came back.</p>
+      <div class="row">
+        <button class="primary" id="btn-lab-run">Run Revive (test)</button>
+        <button class="ghost" id="btn-lab-repair">Repair</button>
+        <button class="ghost" id="btn-lab-verify">Verify result</button>
+        <button class="ghost" id="btn-lab-report">Generate report</button>
+        <button class="ghost" id="btn-lab-reset">Reset device</button>
+      </div>
+      <div id="lab-run-out"></div>
+    </div>
+
+    <div class="card">
+      <h2>Scenarios and history</h2>
+      <div id="lab-scenarios"></div>
+      <h3 style="font-size:14px">Test history</h3>
+      <p class="sub" id="lab-history-stats"></p>
+      <div id="lab-history"></div>
     </div>
   </section>
 </main>
@@ -564,6 +625,238 @@ async function buildDemo() {
   } else { alert(data.error || 'could not create demo data'); }
 }
 
+
+/* ---------- LAB TESTING ---------- */
+const LAB_BRICKS = [
+  {type:'gpt',      label:'Brick GPT'},
+  {type:'boot',     label:'Kill boot'},
+  {type:'nvram',    label:'Damage NVRAM'},
+  {type:'emmc',     label:'Simulate bad eMMC'},
+  {type:'userdata', label:'Corrupt userdata'},
+  {type:'brom',     label:'MTK BROM mode'},
+  {type:'edl',      label:'Qualcomm EDL 9008'},
+];
+let LAB_INFO = null;
+
+const labBadge = (v) => `<span class="risk ${(v==='PASS'||v===true)?'low':(v==='FAIL'||v===false)?'blocked':'unknown'}">${esc(v===true?'PASS':v===false?'FAIL':v)}</span>`;
+
+function labOptions() {
+  const raw = ($('lab-opt').value || '').trim();
+  const out = {};
+  raw.split(/[,\s]+/).forEach(pair => {
+    if (pair.includes('=')) { const [k,v] = pair.split('='); out[k.trim()] = v.trim(); }
+  });
+  return out;
+}
+
+async function labLoadInfo() {
+  LAB_INFO = await api('lab.info', {});
+  if (!LAB_INFO.ok) { $('lab-status').innerHTML = errbox(LAB_INFO); return; }
+  const chip = $('lab-chip');
+  chip.innerHTML = LAB_INFO.profiles.map(p =>
+    `<option value="${esc(p.chipset)}">${esc(p.chipset)} - ${esc(p.vendor)} ${esc(p.model)}</option>`).join('');
+  const box = $('lab-bricks');
+  box.innerHTML = LAB_BRICKS.map(b =>
+    `<button class="ghost" data-lab-brick="${esc(b.type)}">${esc(b.label)}</button>`).join('');
+  box.querySelectorAll('button').forEach(btn => { btn.onclick = () => labBrick(btn.dataset.labBrick); });
+  $('lab-scenarios').innerHTML = table(
+    [{label:'scenario', key:'id', mono:true}, {label:'label', key:'label'},
+     {label:'platforms', render:r=>(r.platforms||[]).join(', ')},
+     {label:'severity', key:'severity'},
+     {label:'expected signals', render:r=>(r.expected_signals||[]).join(', ')},
+     {label:'repair', render:r=>r.repairable?esc(r.repair_summary):'<i>no software repair</i>'}],
+    LAB_INFO.scenarios);
+  await labRefreshDevices();
+}
+
+async function labRefreshDevices() {
+  const data = await api('lab.list', {});
+  const sel = $('lab-device');
+  const devices = data.devices || [];
+  sel.innerHTML = devices.length
+    ? devices.map(d => `<option value="${esc(d.id)}">${esc(d.id)} [${esc(d.status||'?')}]</option>`).join('')
+    : '<option value="">(no devices - create one)</option>';
+  await labRefreshHistory();
+}
+
+async function labRefreshHistory() {
+  const data = await api('lab.history', {limit: 25});
+  const rows = data.history || [];
+  $('lab-history').innerHTML = rows.length
+    ? table(
+        [{label:'timestamp', key:'timestamp', mono:true}, {label:'device', key:'device'},
+         {label:'scenario', key:'scenario'}, {label:'detection', render:r=>labBadge(r.detection)},
+         {label:'repair', render:r=>labBadge(r.repair)},
+         {label:'verification', render:r=>labBadge(r.verification)},
+         {label:'result', render:r=>labBadge(r.result)}], rows)
+    : '<p class="muted">No tests run yet. Brick a device and run Revive against it.</p>';
+  const stats = $('lab-history-stats');
+  if (stats) stats.textContent =
+    `${data.runs || 0} run(s): ${data.passed || 0} passed, ${data.failed || 0} failed`;
+}
+
+async function labDelete() {
+  const device = labDeviceId();
+  if (!device) { alert('Select a device first.'); return; }
+  if (!confirm('Delete virtual device ' + device + '? Its image, logs and reports go with it.')) return;
+  const data = await api('lab.delete', {device});
+  if (!data.ok) { alert(data.error || 'could not delete the device'); return; }
+  await labRefreshDevices();
+  await labStatus();
+}
+
+function labDeviceId() { return $('lab-device').value || ''; }
+
+async function labStatus() {
+  const out = $('lab-status');
+  const device = labDeviceId();
+  if (!device) { out.innerHTML = '<p class="muted">No virtual device yet. Create one above.</p>'; return; }
+  out.innerHTML = '<p class="muted">reading the virtual device…</p>';
+  const data = await api('lab.status', {device});
+  if (!data.ok) { out.innerHTML = errbox(data); return; }
+  const prof = data.device.profile || {}, health = data.health || {}, boot = data.boot || {};
+  const state = data.device.status || '?';
+  const stateColour = state === 'bricked' ? 'blocked' : (state === 'recovered' ? 'medium' : 'low');
+  out.innerHTML = `
+    <div class="kv">
+      <div>active device</div><div class="mono">${esc(data.device.id)}</div>
+      <div>chipset</div><div class="mono">${esc(prof.chipset)} (${esc(prof.platform)})</div>
+      <div>vendor / model</div><div class="mono">${esc(prof.vendor)} ${esc(prof.model)}</div>
+      <div>storage</div><div class="mono">${esc(prof.storage)} nominal · ${esc(health.capacity_human || '')} · ${esc(prof.interface)}</div>
+      <div>boot mode</div><div class="mono">${esc(prof.boot_mode)}</div>
+      <div>status</div><div><span class="risk ${stateColour}">${esc(state)}</span></div>
+      <div>eMMC health</div><div class="mono">${esc(health.state)} · PRE_EOL ${esc(health.pre_eol)} (${esc(health.pre_eol_text)}) · ${esc(health.life_a_text)} · ${esc(health.bad_blocks)} bad block(s)</div>
+      <div>boot</div><div class="mono">${esc(boot.summary || '')}</div>
+      <div>faults</div><div class="mono">${esc((data.device.active_faults||[]).join(', ') || 'none')}</div>
+      <div>fault signals</div><div class="mono">${esc((data.signals||[]).join(', ') || 'none')}</div>
+    </div>
+    <div style="margin-top:10px">
+      ${table([{label:'partition', key:'name', mono:true},
+               {label:'size', key:'size_human'}, {label:'nominal', key:'nominal_size_human'},
+               {label:'kind', key:'kind'}, {label:'status', render:r=>labBadge(r.status==='ok')},
+               {label:'issues', render:r=>(r.issues||[]).join('; ')}], data.partitions || [])}
+    </div>`;
+}
+
+async function labCreate() {
+  const out = $('lab-status');
+  out.innerHTML = '<p class="muted">creating the virtual device…</p>';
+  const data = await api('lab.create', {chip: $('lab-chip').value, storage: $('lab-storage').value.trim(),
+                                        options: labChipOptions()}, {sync:false});
+  if (!data.ok) { out.innerHTML = errbox(data); return; }
+  await labRefreshDevices();
+  $('lab-device').value = data.device.id;
+  await labStatus();
+}
+
+function labChipOptions() {
+  const out = {};
+  const manufacturer = $('lab-manufacturer').value.trim();
+  const health = $('lab-health').value;
+  const firmware = $('lab-firmware').value.trim();
+  if (manufacturer) out.manufacturer = manufacturer;
+  if (health) out.health = health;
+  if (firmware) out.firmware_version = firmware;
+  return out;
+}
+
+async function labChip() {
+  const device = labDeviceId();
+  if (!device) { alert('Create or select a device first.'); return; }
+  const options = labChipOptions();
+  if (!Object.keys(options).length) { alert('Nothing to apply: set a manufacturer, health or firmware version.'); return; }
+  const data = await api('lab.set', {device, options});
+  if (!data.ok) { alert(data.error || 'could not change the chip settings'); return; }
+  await labStatus();
+}
+
+async function labBrick(type) {
+  const out = $('lab-brick-out');
+  out.innerHTML = '<p class="muted">bricking…</p>';
+  const data = await api('lab.brick', {type, options: labOptions(), device: labDeviceId()});
+  if (!data.ok) { out.innerHTML = errbox(data); return; }
+  out.innerHTML = `<ul class="findings">
+    <li class="finding fatal"><b>${esc(data.label)} applied to ${esc(data.device)}</b>
+      <div class="muted">${esc(data.effect || '')}</div>
+      ${data.symptom ? `<div class="muted">symptom: ${esc(data.symptom)}</div>` : ''}
+      ${data.write_behaviour ? `<div class="muted">${esc(data.write_behaviour)}</div>` : ''}
+      <div class="hint">expected signals: <code>${esc((data.expected_signals||[]).join(', '))}</code></div>
+      ${(data.advice||[]).length ? `<ul class="fix">${data.advice.map(a=>`<li>${esc(a)}</li>`).join('')}</ul>` : ''}
+    </li></ul>`;
+  await labStatus();
+}
+
+async function labRun() {
+  const out = $('lab-run-out');
+  out.innerHTML = '<p class="muted">running the workflow: brick → diagnose → repair → verify…</p>';
+  const data = await api('lab.run', {device: labDeviceId(), options: labOptions()}, {sync:false});
+  if (!data.ok && !data.runs) { out.innerHTML = errbox(data); return; }
+  const runs = data.runs || [];
+  out.innerHTML = `<p>${runs.length} scenario(s): ${esc(data.passed||0)} passed,
+      ${esc((data.total||0) - (data.passed||0))} failed · report: <code>${esc((data.paths||{}).html || '')}</code></p>` +
+    runs.map(r => `
+      <div class="card" style="background:var(--panel2)">
+        <h2>${esc(r.scenario_label || r.scenario)} ${labBadge(r.result)}</h2>
+        ${table([{label:'stage', key:'name'}, {label:'verdict', render:x=>labBadge(x.verdict)},
+                 {label:'detail', key:'detail'}], [r.detection, r.repair, r.verification])}
+        ${r.detection && r.detection.missing && r.detection.missing.length
+          ? `<p class="muted">missed signals: <code>${esc(r.detection.missing.join(', '))}</code></p>` : ''}
+        ${r.before && r.before.findings ? findings(r.before.findings) : ''}
+      </div>`).join('');
+  await labRefreshDevices();
+  await labStatus();
+}
+
+async function labRepair() {
+  const out = $('lab-run-out');
+  out.innerHTML = '<p class="muted">repairing…</p>';
+  const data = await api('lab.repair', {device: labDeviceId(), options: labOptions()});
+  if (!data.ok) { out.innerHTML = errbox(data); return; }
+  const lines = [].concat(data.changes || [],
+    (data.written||[]).map(w => `wrote ${w.partition}: ${w.bytes} bytes, read-back ${w.verified ? 'verified' : 'MISMATCH'}`),
+    (data.handshake||[]).map(h => `${h.stage}: ${h.detail}`),
+    data.note ? [data.note] : []);
+  out.innerHTML = `<ul class="findings"><li class="finding ${data.repaired?'ok':'error'}">
+    <b>${esc(data.label)}: ${data.repaired ? 'repaired' : 'not repaired'}</b>
+    ${lines.length ? `<ul class="fix">${lines.map(l=>`<li>${esc(l)}</li>`).join('')}</ul>` : ''}
+    </li></ul>`;
+  await labStatus();
+}
+
+async function labVerify() {
+  const out = $('lab-run-out');
+  const data = await api('lab.verify', {device: labDeviceId()});
+  out.innerHTML = `<p>${labBadge(data.verdict)} ${esc(data.ok ? 'the device is healthy' : 'the device is not healthy')}</p>` +
+    table([{label:'check', key:'name'}, {label:'result', render:r=>labBadge(r.ok?'PASS':'FAIL')},
+           {label:'detail', key:'detail'}], data.checks || []);
+  await labRefreshDevices();
+}
+
+async function labReport() {
+  const out = $('lab-run-out');
+  out.innerHTML = '<p class="muted">generating the report…</p>';
+  const data = await api('lab.report', {device: labDeviceId()}, {sync:false});
+  if (!data.ok) { out.innerHTML = errbox(data); return; }
+  const r = data.report || {};
+  out.innerHTML = `
+    <p>Report written:</p>
+    <div class="kv"><div>json</div><div class="mono">${esc(data.json||'')}</div>
+    <div>html</div><div class="mono">${esc(data.html||'')}</div></div>
+    <h3 style="font-size:14px">LAB TEST REPORT</h3>
+    ${kv({Device:r.device, Chipset:r.chipset, Scenario:r.scenario_label || r.scenario,
+          Detection:r.detection, Repair:r.repair, Verification:r.verification,
+          Result:r.result})}`;
+}
+
+async function labReset() {
+  const out = $('lab-run-out');
+  const data = await api('lab.reset', {device: labDeviceId()});
+  if (!data.ok) { out.innerHTML = errbox(data); return; }
+  out.innerHTML = `<p class="muted">device rebuilt: faults cleared, ${esc((data.restored_partitions||[]).length || '')} partitions restored from the golden copies.</p>`;
+  await labRefreshDevices();
+  await labStatus();
+}
+
 /* ---------- wiring ---------- */
 document.querySelectorAll('nav button').forEach(btn => btn.onclick = () => {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b === btn));
@@ -587,6 +880,16 @@ $('btn-spv').onclick = sparseVerify;
 $('btn-err').onclick = explainError;
 $('err-search').onkeydown = (e) => { if (e.key === 'Enter') searchErrors(); };
 $('btn-demo').onclick = buildDemo;
+$('btn-lab-create').onclick = labCreate;
+$('btn-lab-refresh').onclick = async () => { await labRefreshDevices(); await labStatus(); };
+$('btn-lab-delete').onclick = labDelete;
+$('btn-lab-chip').onclick = labChip;
+$('btn-lab-run').onclick = labRun;
+$('btn-lab-repair').onclick = labRepair;
+$('btn-lab-verify').onclick = labVerify;
+$('btn-lab-report').onclick = labReport;
+$('btn-lab-reset').onclick = labReset;
+$('lab-device').onchange = labStatus;
 
 (async function boot() {
   const info = await api('info', {});
@@ -601,6 +904,7 @@ $('btn-demo').onclick = buildDemo;
   }
   detect();
   loadGuide();
+  labLoadInfo();
 })();
 </script>
 </body>

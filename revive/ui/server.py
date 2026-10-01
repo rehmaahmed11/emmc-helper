@@ -38,7 +38,9 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_PORT = 8765
 
 # Operations that can take minutes: run them as jobs instead of blocking the request.
-JOB_ROUTES = {"dump.extract", "demo.build", "manifest.create", "convert"}
+JOB_ROUTES = {"dump.extract", "demo.build", "manifest.create", "convert",
+              # A lab run diagnoses and repairs a whole virtual device: seconds, not ms.
+              "lab.run", "lab.create", "lab.report"}
 
 
 @dataclass
@@ -283,7 +285,8 @@ def lan_address() -> str:
 
 def serve(host: str = "0.0.0.0", port: int = DEFAULT_PORT, demo: bool = False,
           open_browser: bool = False, verbose: bool = False,
-          storage: Optional[Path] = None, token: Optional[str] = None) -> int:
+          storage: Optional[Path] = None, token: Optional[str] = None,
+          lab_root: Optional[Path] = None) -> int:
     import tempfile
 
     ctx: Dict[str, Any] = {
@@ -291,6 +294,9 @@ def serve(host: str = "0.0.0.0", port: int = DEFAULT_PORT, demo: bool = False,
         "demo_storage": Path(storage) if storage
         else Path(tempfile.gettempdir()) / "revive-mock-emmc.bin",
         "started": time.time(),
+        # Where the LAB TESTING tab keeps its virtual devices. A request can still name its
+        # own lab folder; this is the default the server was started with.
+        "lab_root": str(lab_root) if lab_root else None,
     }
 
     session_token = token if token is not None else secrets.token_urlsafe(16)

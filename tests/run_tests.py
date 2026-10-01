@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import shutil
 import os
 import sys
 import tempfile
@@ -31,6 +32,12 @@ MODULES = [
     "test_backends",
     "test_dead_device_audit",
     "test_ui",
+    # LAB TESTING
+    "test_lab_device",
+    "test_virtual_emmc",
+    "test_brick_engine",
+    "test_recovery_flow",
+    "test_lab_ui",
 ]
 
 _RESULTS = {"pass": 0, "fail": 0, "error": 0}
@@ -62,6 +69,10 @@ def _run_module(name: str) -> None:
             _FAILURES.append((name, test_name, f"{type(exc).__name__}: {exc}"))
             print(f"  ERROR {test_name}: {type(exc).__name__}: {exc}")
             traceback.print_exc(limit=4)
+        finally:
+            # The lab tests build real device images, so a run that does not clean up after
+            # itself fills the disk. Every test gets a fresh directory and gives it back.
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main(argv: list) -> int:

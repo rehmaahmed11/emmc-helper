@@ -31,7 +31,11 @@ dev = ["pytest>=7.0"]
 revive = "revive.cli:main"
 
 [tool.setuptools]
-packages = ["revive", "revive.core", "revive.storage", "revive.firmware", "revive.ops", "revive.backends", "revive.ui"]
+packages = [
+  "revive", "revive.core", "revive.storage", "revive.firmware", "revive.ops",
+  "revive.backends", "revive.ui",
+  "revive.lab_testing", "revive.lab_testing.scenarios", "revive.lab_testing.reports",
+]
 
 [tool.setuptools.package-data]
 "revive.ui" = ["static/*"]

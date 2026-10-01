@@ -17,6 +17,10 @@ demo/
 *.sparse
 manifest.json
 
+# The LAB TESTING database: virtual device images, per-device logs and generated reports.
+# Regenerable with `python -m revive.lab_testing create ...`, so it stays out of the repo.
+lab_devices/
+
 # Editors / OS
 .idea/
 .vscode/
