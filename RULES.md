@@ -91,7 +91,7 @@ and `revive/backends/__init__.py`); covered by `tests/test_device_archive.py`.
 
 ## Changelog
 
-- **2026-10-01** — Rule 1 added and implemented (this PR): `revive/ops/device_archive.py`
+- **2026-10-01** — Rule 1 added and implemented ([PR #6](https://github.com/rehmaahmed11/emmc-helper/pull/6)): `revive/ops/device_archive.py`
   with per-device folders, sub-folders (`read_info/`, `full_dump/`, `partitions/`, `notes/`),
   100-percent-identity matching, second-precision timestamps that never overwrite, variant
   folders, `revive devices list/show/dump` CLI commands, `devices.list` / `devices.dump`
