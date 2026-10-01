@@ -1,0 +1,14 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Revive - Termux edition launcher. Pure Python standard library, nothing to compile.
+SELF="$0"
+while [ -L "$SELF" ]; do
+  LINK=$(readlink "$SELF"); case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+done
+VARIANT_DIR=$(cd "$(dirname "$SELF")/.." && pwd)
+PY=$(command -v python3 || command -v python)
+if [ -z "$PY" ]; then
+  echo "revive-termux: Python is missing. Run:  pkg install python" >&2
+  exit 127
+fi
+PYTHONPATH="$VARIANT_DIR:$VARIANT_DIR/..${PYTHONPATH:+:$PYTHONPATH}" PYTHONDONTWRITEBYTECODE=1 \
+  exec "$PY" -m revive_termux "$@"
