@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from ..core import usbmodes
 from ..util import ProgressFn, null_progress
+from . import interceptor as interceptor_mod
 from . import usbfinder
 from .base import BackendError, BackendUnavailable, DeviceBackend, DeviceInfo, Partition
 
@@ -103,18 +104,51 @@ class UnisocBackend(DeviceBackend):
     ]
 
     def __init__(self, progress: ProgressFn = null_progress, verbose: bool = False,
-                 timeout: float = 10.0, baud: int = 115200):
+                 timeout: float = 10.0, baud: int = 115200,
+                 wait: bool = False, force_entry: bool = False):
         super().__init__(progress, verbose)
         self.timeout = timeout
         self.baud = baud
+        self.wait = wait
+        self.force_entry = force_entry
         self.endpoints = {"out": 0x01, "in": 0x81}
         self.hello: Optional[UnisocHello] = None
+        self.intercept_result: Optional[interceptor_mod.InterceptResult] = None
 
     def open(self, device: Any = None) -> None:
+        if device is None and (self.wait or self.force_entry):
+            engine = interceptor_mod.UsbInterceptor(
+                target_modes={usbmodes.MODE_UNISOC},
+                force_entry=self.force_entry,
+                verbose=self.verbose,
+            )
+            res = engine.intercept(timeout=self.timeout)
+            self.intercept_result = res
+            if not res.ok or res.device is None:
+                raise BackendUnavailable(
+                    res.error or "No Unisoc device answered the sub-ms interceptor.",
+                    code="unisoc_no_response",
+                    detail="Hold Volume Down while plugging in on most models.",
+                )
+            self.device = res.device
+            self.endpoints = {"out": res.endpoints.out_ep, "in": res.endpoints.in_ep}
+            self.info.usb_id = res.usb_id
+            self.info.mode = usbmodes.MODE_UNISOC
+            self.info.vendor = "Unisoc"
+            if "unisoc_hello_hex" in res.telemetry:
+                self.hello = UnisocHello(raw=bytes.fromhex(res.telemetry["unisoc_hello_hex"]))
+            self.log_line(f"intercepted Unisoc interface ({res.usb_id}) in {res.capture_latency_ms:.3f} ms")
+            return
+
         if device is None:
             devices, warnings = usbfinder.find_devices(VID_UNISOC)
             if not devices:
-                ports = usbfinder.describe_device and []
+                serial_devs = usbfinder.find_serial_devices(
+                    target_modes={usbmodes.MODE_UNISOC}, open_handle=True
+                )
+                if serial_devs:
+                    devices = serial_devs
+            if not devices:
                 raise BackendUnavailable(
                     "No Unisoc device on USB. " + (warnings[0] if warnings else ""),
                     code="unisoc_no_response",
@@ -126,7 +160,8 @@ class UnisocBackend(DeviceBackend):
         self.info.usb_id = f"{int(device.idVendor):04x}:{int(device.idProduct):04x}"
         self.info.mode = usbmodes.MODE_UNISOC
         self.info.vendor = "Unisoc"
-        usbfinder.open_device(device)
+        eps = usbfinder.fast_open_device(device)
+        self.endpoints = {"out": eps.out_ep, "in": eps.in_ep}
         self.log_line("Unisoc interface opened")
 
     def exchange(self, payload: bytes, expect: int = 1024) -> bytes:
@@ -146,6 +181,12 @@ class UnisocBackend(DeviceBackend):
         The payload layout differs between tool generations, so this intentionally starts with
         the smallest plausible frame and surfaces the device's raw answer for identification.
         """
+        if self.hello is not None:
+            return self.hello
+        try:
+            self.device.write(self.endpoints["out"], b"\x7e", 250)
+        except Exception:
+            pass
         attempts = [
             ("empty connect", b"\x00" * 4),
             ("version query", b"\x7f" + b"\x00" * 3),

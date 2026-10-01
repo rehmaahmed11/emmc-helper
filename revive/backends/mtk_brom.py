@@ -5,9 +5,10 @@ charge, shows nothing on screen, and only answers as `0e8d:0003` for a second wh
 in. If BROM answers, the phone is recoverable in principle - the eMMC contents do not matter.
 
 Protocol notes (be honest about provenance):
-  * USB ids, the 0xA0 handshake, the 16-byte command status header and the 0xD0/0xD5/0xD7/0xD8/
-    0xFC command numbers come from public reverse-engineering work on MediaTek's boot ROM
-    (the same body of work every other tool in this space is built on).
+  * USB ids, the 4-byte inverse sync (`0xA0 0x0A 0x50 0x05` -> `0x5F 0xF5 0xAF 0xFA`), the
+    hardware watchdog disable (`WDT_BASE = 0x10007000 <- 0x22000000`), the 16-byte command
+    status header and the 0xD0/0xD5/0xD7/0xD8/0xFC command numbers come from public
+    reverse-engineering work on MediaTek's boot ROM.
   * The BROM status word is a 32-bit value whose high byte is 0x00 (success), 0x02 (security)
     or 0xC0 (fatal). Rather than assuming an endianness, `_parse_status` accepts the reading
     that produces one of those patterns and records which one it used - a wrong guess would
@@ -15,9 +16,10 @@ Protocol notes (be honest about provenance):
   * Everything that can vary between chip generations is in one table (`PROTOCOL`) so it can be
     corrected from one place when field reports come in.
 
-`identify()` is the operation worth trusting first: it reads the hardware code and the security
-state. Reading and writing storage requires the download-agent protocol and is only enabled
-once a DA has been loaded.
+`identify()` is the operation worth trusting first: it reads the hardware code, disables the
+hardware watchdog so the phone stays frozen in BROM/Preloader even with a battery attached, and
+reads the security state. Reading and writing storage requires the download-agent protocol and
+is only enabled once a DA has been loaded.
 """
 from __future__ import annotations
 
@@ -29,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..core import chips, errors, usbmodes
 from ..util import ProgressFn, human_size, null_progress
+from . import interceptor as interceptor_mod
 from . import usbfinder
 from .base import BackendError, BackendUnavailable, DeviceBackend, DeviceInfo, Endpoints, Partition
 
@@ -91,33 +94,81 @@ class MtkBromBackend(DeviceBackend):
     capability_erase = False
     capability_partitions = False
     tested = False
-    protocol = "public reverse-engineering notes (BROM handshake + 0xD0/0xD5/0xD7/0xD8/0xFC)"
+    protocol = "public reverse-engineering notes (4-byte BROM sync + WDT freeze + 0xD0/0xD5/0xD7/0xD8/0xFC)"
     notes = [
         "BROM only appears for about a second after power-up: start the operation, THEN plug in.",
+        "Zero-sleep 4-byte sync hammer (A0->5F, 0A->F5, 50->AF, 05->FA) + WDT disable keeps "
+        "the phone locked in BROM/Preloader even when the battery is attached.",
         "Secure devices (SBC/SLA/DAA) need a matching DA + auth file, or an exploit path.",
         "Memory reads work without a DA; storage reads/writes require a DA to be loaded first.",
     ]
 
     def __init__(self, progress: ProgressFn = null_progress, verbose: bool = False,
-                 timeout: float = 15.0, endian: str = "big"):
+                 timeout: float = 15.0, endian: str = "big",
+                 wait: bool = False, force_entry: bool = False, force_brom: bool = False):
         super().__init__(progress, verbose)
         self.timeout = timeout
         self.endian = endian
+        self.wait = wait
+        self.force_entry = force_entry
+        self.force_brom = force_brom
         self.eps = Endpoints()
         self.config: Optional[BromTargetConfig] = None
         self.da_loaded = False
+        self.wdt_disabled = False
+        self.intercept_result: Optional[interceptor_mod.InterceptResult] = None
         self._status_endian = "big"      # resolved on the first response
 
     # -- connection -------------------------------------------------------------------
     def open(self, device: Any = None) -> None:
+        if device is None and (self.wait or self.force_entry or self.force_brom):
+            engine = interceptor_mod.UsbInterceptor(
+                target_modes={usbmodes.MODE_MTK_BROM, usbmodes.MODE_MTK_PRELOADER, usbmodes.MODE_MTK_DA},
+                force_entry=self.force_entry,
+                force_brom=self.force_brom,
+                verbose=self.verbose,
+            )
+            res = engine.intercept(timeout=self.timeout)
+            self.intercept_result = res
+            if not res.ok or res.device is None:
+                raise BackendUnavailable(
+                    res.error or "No MediaTek device answered the sub-ms interceptor.",
+                    code="no_device",
+                    detail="Hold Vol Up + Vol Down while plugging in (or hold Power + Vol Up + "
+                           "Vol Down for 10s if the battery is attached).",
+                )
+            self.device = res.device
+            self.eps = res.endpoints
+            self.wdt_disabled = res.wdt_disabled
+            self.info.usb_id = res.usb_id
+            self.info.mode = res.mode
+            self.info.vendor = "MediaTek"
+            self.info.extras["interception"] = {
+                "capture_latency_ms": round(res.capture_latency_ms, 4),
+                "handshake_duration_ms": round(res.handshake_duration_ms, 4),
+                "sync_bytes": res.sync_bytes,
+                "wdt_disabled": res.wdt_disabled,
+                "forced_from_mode": res.forced_from_mode,
+                "preloader_crashed_to_brom": res.preloader_crashed_to_brom,
+            }
+            self.log_line(f"intercepted {self.info.usb_id} in {res.capture_latency_ms:.3f} ms")
+            return
+
         if device is None:
             devices, warnings = usbfinder.find_devices(VID_MEDIATEK)
+            if not devices:
+                serial_devs = usbfinder.find_serial_devices(
+                    target_modes={usbmodes.MODE_MTK_BROM, usbmodes.MODE_MTK_PRELOADER},
+                    open_handle=True,
+                )
+                if serial_devs:
+                    devices = serial_devs
             if not devices:
                 raise BackendUnavailable(
                     "No MediaTek device on USB. " + (warnings[0] if warnings else ""),
                     code="no_device",
                     detail="Power the phone off, start the operation, then plug the cable in while "
-                           "holding Volume Up + Volume Down.",
+                           "holding Volume Up + Volume Down (or use `revive intercept --force`).",
                 )
             preferred = [d for d in devices if int(d.idProduct) in (PID_BROM, PID_PRELOADER)]
             device = (preferred or devices)[0]
@@ -127,36 +178,67 @@ class MtkBromBackend(DeviceBackend):
         self.info.mode = mode
         self.info.vendor = "MediaTek"
         self.log_line(f"found {self.info.usb_id} ({label})")
-        self.eps = usbfinder.open_device(device)
+        self.eps = usbfinder.fast_open_device(device)
         self.handshake()
+        if self.force_brom and self.info.mode == usbmodes.MODE_MTK_PRELOADER:
+            self.crash_preloader_to_brom()
 
-    def handshake(self) -> None:
-        """Send the BROM wake-up byte and confirm the boot ROM answers."""
-        attempts = (
-            ("ctrl 0x20 A0", lambda: self.device.ctrl_transfer(0x21, 0x20, 0, 0, b"\xA0", 1000)),
+    def handshake(self, max_attempts: int = 80) -> List[Dict[str, str]]:
+        """Execute the zero-sleep 4-byte inverse sync (`0xA0 0x0A 0x50 0x05` -> `0x5F 0xF5 0xAF 0xFA`)."""
+        engine = interceptor_mod.UsbInterceptor(
+            max_sync_attempts=max_attempts,
+            disable_wdt=False,
+            verbose=self.verbose,
         )
-        last_error = None
-        for label, action in attempts:
+        res = interceptor_mod.InterceptResult()
+        try:
+            sync_pairs = engine.mtk_handshake_hammer(self.device, self.eps, res)
+            self.intercept_result = res
+            self.info.extras["sync_bytes"] = sync_pairs
+            self.log_line(
+                "handshake locked: " + ", ".join(f"{p['tx']}->{p['rx']}" for p in sync_pairs)
+            )
+            return sync_pairs
+        except Exception as exc:
             try:
-                self.log_line(f"handshake: {label}")
-                action()
-                time.sleep(0.05)
-                answer = self.device.read(self.eps.in_ep, 1, 1000)
-                if answer:
-                    self.log_line(f"handshake answer: {bytes(answer).hex()}")
-                    return
-                last_error = "device did not answer the wake-up byte"
-            except Exception as exc:
-                last_error = str(exc)
-                try:
-                    usbfinder.reset_device(self.device)
-                except Exception:
-                    pass
-        raise BackendError(
-            "The boot ROM did not answer the handshake" + (f" ({last_error})" if last_error else ""),
-            code="2005",
-            detail="This is almost always timing, cable, port or driver related - see the fixes.",
-        )
+                usbfinder.reset_device(self.device)
+            except Exception:
+                pass
+            raise BackendError(
+                f"The boot ROM did not answer the handshake ({exc})",
+                code="2005",
+                detail="This is almost always timing, cable, port or driver related - see the fixes.",
+            )
+
+    def disable_watchdog(self, hwcode: Optional[int] = None) -> bool:
+        """Disable the hardware watchdog timer (WDT) so the phone stays in BROM/Preloader."""
+        code = hwcode if hwcode is not None else self.info.hwcode
+        wdt_addr = interceptor_mod.wdt_base_for_hwcode(code)
+        try:
+            self.write_memory(wdt_addr, struct.pack(">I", 0x22000000))
+            self.wdt_disabled = True
+            self.info.extras["wdt_disabled"] = True
+            self.info.extras["wdt_address"] = f"0x{wdt_addr:08X}"
+            self.log_line(f"disabled hardware watchdog at 0x{wdt_addr:08X}")
+            return True
+        except Exception as exc:
+            self.log_line(f"watchdog disable skipped: {exc}")
+            return False
+
+    def crash_preloader_to_brom(self) -> bool:
+        """Crash an active Preloader session (`0e8d:2000`) to force warm-reset into BROM (`0e8d:0003`)."""
+        engine = interceptor_mod.UsbInterceptor(force_brom=True, verbose=self.verbose)
+        res = self.intercept_result or interceptor_mod.InterceptResult()
+        engine._crash_preloader_into_brom(self.device, self.eps, res)
+        self.intercept_result = res
+        if res.mode == usbmodes.MODE_MTK_BROM and res.device is not None:
+            self.device = res.device
+            self.eps = res.endpoints
+            self.info.mode = usbmodes.MODE_MTK_BROM
+            self.info.usb_id = "0e8d:0003"
+            self.log_line("Preloader crashed and re-caught in BROM (0e8d:0003)")
+            return True
+        return res.preloader_crashed_to_brom
 
     # -- low level --------------------------------------------------------------------
     def _send(self, command: int, payload: bytes = b"") -> None:
@@ -194,7 +276,7 @@ class MtkBromBackend(DeviceBackend):
     def read_memory(self, address: int, length: int) -> bytes:
         """Command 0xD8: read `length` bytes from `address` in the device's address space."""
         self._send(PROTOCOL["READ16"], struct.pack(">II", address, length))
-        header = self._expect_ok(self._read(16), f"read 0x{length:x} bytes at 0x{address:08x}")
+        self._expect_ok(self._read(16), f"read 0x{length:x} bytes at 0x{address:08x}")
         data = self._read(length)
         return data[4:] if len(data) == length + 4 else data
 
@@ -256,12 +338,14 @@ class MtkBromBackend(DeviceBackend):
         self.info.storage = chip.storage if chip else ""
         config = self.config or self.get_target_config()
         self.info.security = config.to_dict()
+        if not self.wdt_disabled:
+            self.disable_watchdog(code)
         if config.sbc_enabled or config.sla_enabled or config.daa_enabled:
             self.info.notes.append(
                 "Secure boot is enabled (SBC/SLA/DAA): a matching DA + auth file is required to "
                 "read or write storage."
             )
-        if chip and not chip.confirmed:
+        if chip and chip.confidence != chips.CONFIRMED:
             self.info.notes.append(
                 f"Chip name comes from a {chip.confidence} source - confirm with the firmware's "
                 "scatter file before flashing anything."
@@ -330,7 +414,7 @@ class MtkBromBackend(DeviceBackend):
                 data = self.read_memory(offset + written, want)
                 fh.write(data)
                 written += len(data)
-                progress(written, length, "reading storage")
+                self.progress(written, length, "reading storage")
         return {"output": str(out), "bytes": written, "offset": offset}
 
     def write_flash(self, offset: int, data_path, length: Optional[int] = None) -> Dict[str, Any]:

@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 from ..core import errors, usbmodes
 from ..storage import gpt as gpt_mod
 from ..util import ProgressFn, human_size, null_progress
+from . import interceptor as interceptor_mod
 from . import usbfinder
 from .base import BackendError, BackendUnavailable, DeviceBackend, DeviceInfo, Partition
 
@@ -108,19 +109,62 @@ class QualcommEdlBackend(DeviceBackend):
     ]
 
     def __init__(self, progress: ProgressFn = null_progress, verbose: bool = False,
-                 timeout: float = 20.0, memory: str = "", sector_size: int = 512):
+                 timeout: float = 20.0, memory: str = "", sector_size: int = 512,
+                 wait: bool = False, force_entry: bool = False):
         super().__init__(progress, verbose)
         self.timeout = timeout
         self.memory = memory                 # eMMC / UFS / nand - auto-detected when possible
         self.sector_size = sector_size
+        self.wait = wait
+        self.force_entry = force_entry
         self.hello: Optional[SaharaHello] = None
+        self.intercept_result: Optional[interceptor_mod.InterceptResult] = None
         self.firehose_ready = False
         self.endpoints = {"cmd_out": 0x01, "cmd_in": 0x81, "data_out": 0x01, "data_in": 0x81}
 
     # -- connection -------------------------------------------------------------------
     def open(self, device: Any = None) -> None:
+        if device is None and (self.wait or self.force_entry):
+            engine = interceptor_mod.UsbInterceptor(
+                target_modes={usbmodes.MODE_QC_EDL},
+                force_entry=self.force_entry,
+                verbose=self.verbose,
+            )
+            res = engine.intercept(timeout=self.timeout)
+            self.intercept_result = res
+            if not res.ok or res.device is None:
+                raise BackendUnavailable(
+                    res.error or "No Qualcomm EDL (9008) device answered the sub-ms interceptor.",
+                    code="no_device",
+                    detail="Power off, then connect - or let `--force` transition ADB/Fastboot/Diag "
+                           "into EDL 9008.",
+                )
+            self.device = res.device
+            self.endpoints = {
+                "cmd_out": res.endpoints.out_ep, "cmd_in": res.endpoints.in_ep,
+                "data_out": res.endpoints.out_ep, "data_in": res.endpoints.in_ep,
+            }
+            self.info.usb_id = res.usb_id
+            self.info.mode = usbmodes.MODE_QC_EDL
+            self.info.vendor = "Qualcomm"
+            if "sahara_version" in res.telemetry:
+                self.hello = SaharaHello(
+                    version=int(res.telemetry.get("sahara_version", 2)),
+                    min_version=int(res.telemetry.get("sahara_min_version", 1)),
+                    max_packet=int(res.telemetry.get("sahara_max_packet", 1024)),
+                    mode=int(res.telemetry.get("sahara_mode", 0)),
+                )
+            self.log_line(f"intercepted EDL interface ({res.usb_id}) in {res.capture_latency_ms:.3f} ms")
+            return
+
         if device is None:
             devices, warnings = usbfinder.find_devices(VID_QC, PID_EDL)
+            if not devices:
+                serial_devs = usbfinder.find_serial_devices(
+                    target_modes={usbmodes.MODE_QC_EDL}, open_handle=True
+                )
+                if serial_devs:
+                    devices = serial_devs
             if not devices:
                 raise BackendUnavailable(
                     "No Qualcomm EDL (9008) device on USB. " + (warnings[0] if warnings else ""),
@@ -133,7 +177,11 @@ class QualcommEdlBackend(DeviceBackend):
         self.info.usb_id = f"{VID_QC:04x}:{PID_EDL:04x}"
         self.info.mode = usbmodes.MODE_QC_EDL
         self.info.vendor = "Qualcomm"
-        usbfinder.open_device(device)
+        eps = usbfinder.fast_open_device(device)
+        self.endpoints = {
+            "cmd_out": eps.out_ep, "cmd_in": eps.in_ep,
+            "data_out": eps.out_ep, "data_in": eps.in_ep,
+        }
         self.log_line("opened EDL interface")
 
     # -- Sahara -----------------------------------------------------------------------
