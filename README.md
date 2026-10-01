@@ -25,6 +25,10 @@ mtkclient and QFIL do — but it explains what it found in plain English, checks
 > every write. Everything that works on *files* — inspection, validation, planning, dumps,
 > conversions, verification — is fully usable today.
 
+> **Rules:** the project's binding rules live in [RULES.md](RULES.md) — the rule book that is
+> updated whenever a new rule is added and after every PR. Rule 1 is the **device archive**:
+> every connected device gets its own folder and every hardware read a timestamped file.
+
 ---
 
 ## Why another flashing tool?
@@ -96,6 +100,33 @@ revive err --log brom.log         # read the codes out of a log file and explain
 revive inspect ./firmware         # classify a firmware folder or a single image
 ```
 
+### Device archive (Rule 1 of [RULES.md](RULES.md))
+
+Every time a device connects and its hardware is read (`detect`, `identify`, `intercept`, or
+the web UI), Revive saves the read info into a **per-device archive** — one folder per
+device that ever connected, named after the device:
+
+```
+~/.revive/devices/                          # or $REVIVE_DEVICE_ARCHIVE / --archive-root
+  Infinix Hot 8 X650B/                      # variants (X650 / X650B / X650C) = separate folders
+    device.json                             # identity record + connect count + timestamps
+    read_info/read_info_20261001_194503.json   # one per hardware read — never overwritten
+    read_info/read_info_20261001_194504.json   # (timestamp includes the seconds)
+    full_dump/dump_20261001_195012.bin       # full flash dumps (hard link or copy)
+    partitions/partitions_20261001_194503.json
+    notes/
+```
+
+A device is "the same device" when its read info matches a previous one **100 percent** on
+the stable hardware fields (USB id, vendor/product/serial, chip, hwcode, storage). Session
+fields (mode, bus, time, security flags) don't split a device; model variants do.
+
+```bash
+revive devices list                          # every device that ever connected
+revive devices show Infinix                  # identity record + files (name or unique prefix)
+revive devices dump "Infinix Hot 8 X650B" dump.bin   # place a full dump in its full_dump/
+```
+
 ### Work safely
 
 ```bash
@@ -148,6 +179,7 @@ with one click per fault, run Revive against it, verify the result and generate 
 | **Images** | sparse ↔ raw (streaming, 4 GiB-safe), LZ4 (decompress + verify), boot v0–v4/vendor_boot, super.img (liblp 1.0–1.2+), ext4/F2FS/EROFS superblocks |
 | **Verification** | Folder manifests, sparse checksum verification, boot image checks, eMMC health verdict |
 | **Backends** | `mock` (always available), `mtk`, `qualcomm`, `unisoc`, `fastboot` — each advertises exactly what it can do and whether it has been verified on hardware |
+| **Device archive** | Rule 1 of RULES.md: per-device folders named after the device, `read_info/` file per hardware read (second-precision timestamps, never overwritten), `full_dump/` + `partitions/` + `notes/` sub-folders, 100-percent-identity matching so model variants get their own folders |
 | **LAB TESTING** | Virtual devices (MT6765/6768/6877, Snapdragon 450/660/7-series, Unisoc), a simulated eMMC with CID/CSD/EXT_CSD and wear, seven injectable faults, and a graded diagnose → repair → verify loop with HTML + JSON reports |
 
 ## Scope and honesty
@@ -170,8 +202,9 @@ with one click per fault, run Revive against it, verify the result and generate 
 ## Development
 
 ```bash
-python3 tests/run_tests.py              # 252 tests, no pytest required
+python3 tests/run_tests.py              # 279 tests, no pytest required
 python3 tests/run_tests.py gpt sparse   # filter by module name
+python3 tests/run_tests.py device_archive  # the device archive (Rule 1)
 python3 tests/run_tests.py lab          # just the LAB TESTING modules
 python3 tools/make_demo.py --out /tmp/revive-demo    # rebuild the fixtures
 ```
@@ -188,7 +221,7 @@ revive/
   core/      errors, chip table, USB modes
   storage/   gpt, sparse, lz4blk, bootimg, magic, ext4fs, emmc, superimg, fsinfo
   firmware/  scatter, rawprogram, pac, da, detect
-  ops/       plan, dump, verify, convert
+  ops/       plan, dump, verify, convert, dossier, device_archive
   backends/  base, mtk_brom, qualcomm_edl, unisoc, fastboot, mock, usbfinder
   lab_testing/   the virtual device laboratory: profiles, virtual eMMC, brick engine,
                  scenarios, recovery grading, reports, its own CLI

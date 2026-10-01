@@ -27,6 +27,7 @@ CAPABILITY_KEYS = {"name", "label", "vendor", "modes", "read", "write", "erase",
 UI_ROUTES = {
     "info", "chips", "modes", "errors", "errors.decode", "drivers", "detect", "identify",
     "intercept", "dossier.list",
+    "devices.list", "devices.dump",
     "inspect", "plan", "dump.analyse", "dump.extract", "dump.scan", "gpt.list", "gpt.repair",
     "convert", "super.list", "super.extract", "manifest.create", "manifest.verify",
     "sparse.verify", "demo.build",
