@@ -392,6 +392,234 @@ def build_demo(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
         return _error(exc)
 
 
+
+# --------------------------------------------------------------------------------------
+# LAB TESTING - virtual devices (revive.lab_testing). Nothing here touches hardware.
+# --------------------------------------------------------------------------------------
+
+from ..lab_testing import SPEC_OPTIONS as SPEC_OPTION_NAMES      # noqa: E402  (used by lab.*)
+
+
+def _lab(payload: Dict[str, Any], ctx: Dict[str, Any]):
+    """The lab database, rooted where the server was told (or ./lab_devices)."""
+    from ..lab_testing import LabBench
+
+    root = payload.get("lab") or ctx.get("lab_root") or None
+    return LabBench(root)
+
+
+def _lab_device(payload: Dict[str, Any], ctx: Dict[str, Any]):
+    bench = _lab(payload, ctx)
+    device = bench.get(payload.get("device"))
+    device.attach_log()
+    return bench, device
+
+
+def lab_info(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything the LAB TESTING tab needs to populate itself."""
+    from ..lab_testing import brick_types
+    from ..lab_testing.device import PROFILES
+    from ..lab_testing.scenarios import all_scenarios
+
+    bench = _lab(payload, ctx)
+    return {
+        "ok": True, "root": str(bench.root),
+        "profiles": [p.to_dict() for p in PROFILES.values()],
+        "scenarios": [s.to_dict() for s in all_scenarios()],
+        "brick_types": brick_types(),
+        "devices": bench.list_devices(),
+        "active": bench.summary().get("active", ""),
+        "health_states": ["healthy", "warning", "dead"],
+    }
+
+
+def lab_list(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    bench = _lab(payload, ctx)
+    return {"ok": True, **bench.summary()}
+
+
+def _chip_options(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The chip settings a request carries, either as `options` or as flat keys."""
+    options = dict(payload.get("options") or {})
+    for key in ("manufacturer", "size", "capacity", "health", "pre_eol", "firmware_version",
+                "product_name", "serial", "write_cycles", "bad_blocks"):
+        if payload.get(key) not in (None, "") and key not in options:
+            options[key] = payload[key]
+    return options
+
+
+def lab_create(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    from ..lab_testing import apply_options
+
+    bench = _lab(payload, ctx)
+    device = bench.create(chip=str(payload.get("chip") or "MT6768"),
+                          storage=payload.get("storage"),
+                          image_bytes=int(payload.get("image_bytes") or 32 * 1024 * 1024),
+                          vendor=payload.get("vendor"), model=payload.get("model"))
+    try:
+        applied = apply_options(device.emmc, _chip_options(payload))
+        if applied:
+            device.save()
+        return {"ok": True, "device": device.to_dict(),
+                "partitions": [p.to_dict() for p in device.partitions],
+                "health": device.emmc.health(), "boot": device.boot().to_dict(),
+                "applied": applied, "chip_options": sorted(SPEC_OPTION_NAMES)}
+    finally:
+        device.close()
+
+
+def lab_set(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Change what the active device's eMMC reports: maker, size, health, firmware version."""
+    from ..lab_testing import apply_options
+
+    bench, device = _lab_device(payload, ctx)
+    try:
+        applied = apply_options(device.emmc, _chip_options(payload))
+        device.save()
+        bench.update_status(device.id, device.status)
+        decoded = device.emmc.registers_decoded()
+        return {"ok": True, "device": device.id, "applied": applied,
+                "health": device.emmc.health(), "verdict": decoded["verdict"],
+                "summary": decoded["summary"], "signals": device.emmc.signals(),
+                "chip_options": sorted(SPEC_OPTION_NAMES)}
+    finally:
+        device.close()
+
+
+def lab_status(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    from ..lab_testing import collect_signals
+
+    bench, device = _lab_device(payload, ctx)
+    try:
+        return {"ok": True, "device": device.to_dict(), "verify": device.verify(),
+                "signals": collect_signals(device)["signals"],
+                "health": device.emmc.health(), "boot": device.boot().to_dict(),
+                "ext_csd": device.emmc.registers(),
+                "partitions": [p.to_dict() for p in device.partitions]}
+    finally:
+        device.close()
+
+
+def lab_brick(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    from ..lab_testing import BrickEngine
+
+    bench, device = _lab_device(payload, ctx)
+    try:
+        options = payload.get("options") or {}
+        if isinstance(options, str):
+            options = {k: v for k, v in (item.split("=", 1)
+                                         for item in options.split(",") if "=" in item)}
+        result = BrickEngine(device).apply(str(payload.get("type") or "gpt"), options)
+        bench.update_status(device.id, device.status)
+        return {"ok": True, **result}
+    finally:
+        device.close()
+
+
+def lab_repair(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    from ..lab_testing import BrickEngine
+
+    bench, device = _lab_device(payload, ctx)
+    try:
+        result = BrickEngine(device).repair(payload.get("type"),
+                                            payload.get("options") or {})
+        bench.update_status(device.id, device.status)
+        return {"ok": bool(result.get("repaired")), **result}
+    finally:
+        device.close()
+
+
+def lab_verify(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    bench, device = _lab_device(payload, ctx)
+    try:
+        check = device.verify()
+        bench.update_status(device.id, device.status)
+        return {"ok": check["ok"], **check}
+    finally:
+        device.close()
+
+
+def lab_reset(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    from ..lab_testing import BrickEngine
+
+    bench, device = _lab_device(payload, ctx)
+    try:
+        info = BrickEngine(device).reset()
+        bench.update_status(device.id, device.status)
+        return {"ok": True, **info}
+    finally:
+        device.close()
+
+
+def lab_run(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """The graded workflow: brick -> diagnose -> repair -> verify."""
+    from ..lab_testing import RecoveryTester
+    from ..lab_testing import lab_report as lab_report_mod
+
+    bench, device = _lab_device(payload, ctx)
+    try:
+        tester = RecoveryTester(device, bench=bench)
+        scenarios = payload.get("scenarios")
+        if isinstance(scenarios, str):
+            scenarios = [item.strip() for item in scenarios.split(",") if item.strip()]
+        if not scenarios:
+            scenarios = ([str(payload["scenario"])] if payload.get("scenario")
+                         else tester.engine.available_ids())
+        options = payload.get("options") or {}
+        results = []
+        for scenario_id in scenarios:
+            if len(scenarios) > 1:
+                device.reset()
+                device.save()
+            results.append(tester.run(scenario_id, options,
+                                      repair=not payload.get("no_repair")))
+        report = lab_report_mod.build_report(results, bench.summary())
+        paths = lab_report_mod.write_reports(report, device.reports_dir)
+        from ..util import atomic_write, to_json
+
+        atomic_write(bench.root / "last_report.json", to_json(report).encode("utf-8"))
+        return {"ok": all(r.result == "PASS" for r in results),
+                "result": report.get("result"), "runs": [r.to_dict() for r in results],
+                "report": report, "paths": paths,
+                "passed": sum(1 for r in results if r.result == "PASS"),
+                "total": len(results)}
+    finally:
+        device.close()
+
+
+def lab_report(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    from ..lab_testing import lab_report as lab_report_mod
+
+    bench, device = _lab_device(payload, ctx)
+    try:
+        report = lab_report_mod.build_from_device(device, bench)
+        paths = lab_report_mod.write_reports(report, device.reports_dir)
+        html = ""
+        try:
+            html = Path(paths["html"]).read_text(encoding="utf-8")
+        except OSError:
+            pass
+        # `paths` keeps the two filenames; the rendered document travels separately, because
+        # `paths["html"]` and the document cannot both own the "html" key.
+        return {"ok": True, **paths, "paths": paths, "report": report, "html_content": html}
+    finally:
+        device.close()
+
+
+def lab_history(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    bench = _lab(payload, ctx)
+    return {"ok": True, "history": bench.history(int(payload.get("limit") or 50)),
+            **{k: v for k, v in bench.summary().items() if k != "devices"}}
+
+
+def lab_delete(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    bench = _lab(payload, ctx)
+    name = str(payload.get("device") or "")
+    if not name:
+        return {"ok": False, "error": "a device id is required"}
+    return {"ok": True, **bench.delete(name)}
+
+
 # --------------------------------------------------------------------------------------
 # Routes table + helpers
 # --------------------------------------------------------------------------------------
@@ -421,11 +649,28 @@ ROUTES: Dict[str, Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = 
     "manifest.verify": manifest_verify,
     "sparse.verify": verify_sparse,
     "demo.build": build_demo,
+    # LAB TESTING
+    "lab.info": lab_info,
+    "lab.list": lab_list,
+    "lab.create": lab_create,
+    "lab.status": lab_status,
+    "lab.brick": lab_brick,
+    "lab.repair": lab_repair,
+    "lab.verify": lab_verify,
+    "lab.set": lab_set,
+    "lab.reset": lab_reset,
+    "lab.run": lab_run,
+    "lab.report": lab_report,
+    "lab.history": lab_history,
+    "lab.delete": lab_delete,
 }
 
 # Routes that touch the filesystem or a device - the UI asks for confirmation on these.
 MUTATING = {"dump.extract", "gpt.repair", "convert", "super.extract", "manifest.create",
-            "demo.build", "intercept"}
+            "demo.build", "intercept",
+            # The lab writes files (virtual device images) but never touches hardware.
+            "lab.create", "lab.brick", "lab.repair", "lab.reset", "lab.run", "lab.report",
+            "lab.delete", "lab.set"}
 
 
 def dispatch(route: str, payload: Optional[Dict[str, Any]] = None,

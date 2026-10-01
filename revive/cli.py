@@ -613,11 +613,18 @@ def cmd_demo(args) -> int:
     return 0
 
 
+def cmd_lab(args) -> int:
+    """Hand off to the LAB TESTING module's own CLI (revive.lab_testing.cli)."""
+    from .lab_testing import cli as lab_cli
+
+    return lab_cli.main(["--help"] if getattr(args, "lab_help", False) else args.lab_args)
+
+
 def cmd_serve(args) -> int:
     from .ui import server
 
     return server.serve(args.host, args.port, args.demo, args.open, args.verbose,
-                        args.storage, args.token)
+                        args.storage, args.token, getattr(args, "lab", None))
 
 
 def cmd_guide(args) -> int:
@@ -855,6 +862,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_demo)
 
+    p = sub.add_parser(
+        "lab", help="LAB TESTING: virtual phones, bricks, repair tests (no hardware)",
+        description="Create virtual devices, brick them, run Revive's repair logic against "
+                    "them and verify that they came back. Nothing here touches hardware.",
+        epilog="examples:\n"
+               "  revive lab create --chip MT6768 --storage 64GB\n"
+               "  revive lab brick --type gpt\n"
+               "  revive lab run\n"
+               "  revive lab report\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False)
+    # argparse's REMAINDER will not swallow a leading -h/--help, so the lab's own help flag is
+    # declared here and translated into the lab CLI's `--help`.
+    p.add_argument("-h", "--help", action="store_true", dest="lab_help",
+                   help="show the lab's own help")
+    p.add_argument("lab_args", nargs=argparse.REMAINDER,
+                   help="the lab's own arguments: create | brick | run | report | ...")
+    p.set_defaults(func=cmd_lab)
+
     p = sub.add_parser("serve", help="run the web UI")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8765)
@@ -863,6 +889,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--storage", type=Path)
     p.add_argument("--token", default=None)
+    p.add_argument("--lab", type=Path, default=None,
+                   help="lab database folder for the LAB TESTING tab (default: ./lab_devices)")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("guide", help="workflow / safety / testpoints / backup / drivers")

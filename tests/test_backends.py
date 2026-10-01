@@ -30,6 +30,10 @@ UI_ROUTES = {
     "inspect", "plan", "dump.analyse", "dump.extract", "dump.scan", "gpt.list", "gpt.repair",
     "convert", "super.list", "super.extract", "manifest.create", "manifest.verify",
     "sparse.verify", "demo.build",
+    # LAB TESTING (revive.lab_testing, driven by the "LAB TESTING" tab)
+    "lab.info", "lab.list", "lab.create", "lab.status", "lab.brick", "lab.repair",
+    "lab.verify", "lab.reset", "lab.run", "lab.report", "lab.history", "lab.delete",
+    "lab.set",
 }
 
 

@@ -73,6 +73,19 @@ revive dump-analyse /tmp/revive-demo/dump_full.bin
 revive serve --demo --open                            # the web UI with a simulated device
 ```
 
+### Test the repair logic on a virtual phone (no hardware)
+
+```bash
+python3 -m revive.lab_testing create --chip MT6768 --storage 64GB   # a virtual 64 GB MediaTek phone
+python3 -m revive.lab_testing brick  --type gpt                     # damage its partition table
+python3 -m revive.lab_testing run                                   # diagnose -> repair -> verify: PASS
+python3 -m revive.lab_testing report                                # HTML + JSON lab report
+```
+
+Seven faults, seven device profiles, MediaTek/Qualcomm/Unisoc. The diagnosis and the repairs are
+the same code Revive runs on a real phone, pointed at a simulated eMMC. See
+[docs/lab-testing.md](docs/lab-testing.md).
+
 ### Find out what is wrong
 
 ```bash
@@ -117,6 +130,13 @@ The UI is a single self-contained HTML page served by Python's standard library,
 and no build step. It binds to `0.0.0.0` for bench/LAN use, so every API call requires the
 session token that the launcher prints (and puts in the URL).
 
+```bash
+revive serve --lab ./lab_devices    # where the LAB TESTING tab keeps its virtual devices
+```
+
+The **LAB TESTING** tab is the browser half of the laboratory: create a virtual phone, brick it
+with one click per fault, run Revive against it, verify the result and generate a report.
+
 ## What each part does
 
 | Area | Highlights |
@@ -128,6 +148,7 @@ session token that the launcher prints (and puts in the URL).
 | **Images** | sparse ↔ raw (streaming, 4 GiB-safe), LZ4 (decompress + verify), boot v0–v4/vendor_boot, super.img (liblp 1.0–1.2+), ext4/F2FS/EROFS superblocks |
 | **Verification** | Folder manifests, sparse checksum verification, boot image checks, eMMC health verdict |
 | **Backends** | `mock` (always available), `mtk`, `qualcomm`, `unisoc`, `fastboot` — each advertises exactly what it can do and whether it has been verified on hardware |
+| **LAB TESTING** | Virtual devices (MT6765/6768/6877, Snapdragon 450/660/7-series, Unisoc), a simulated eMMC with CID/CSD/EXT_CSD and wear, seven injectable faults, and a graded diagnose → repair → verify loop with HTML + JSON reports |
 
 ## Scope and honesty
 
@@ -140,14 +161,18 @@ session token that the launcher prints (and puts in the URL).
   afford to lose, and read the plan first.
 - **Read-only by default is a feature.** `gpt-repair` needs `--apply`; extraction and
   inspection never modify their input.
+- **LAB TESTING is a simulation, and says so in every report it writes.** The virtual devices
+  exercise the real diagnosis and repair code against a simulated eMMC; a PASS there means the
+  logic handled that fault correctly, not that a given phone will survive the procedure.
 - Revive cannot recover data from a physically dead NAND/eMMC without a working download mode
   — no software tool can. What it can do is tell you which failure you have.
 
 ## Development
 
 ```bash
-python3 tests/run_tests.py              # 88 tests, no pytest required
+python3 tests/run_tests.py              # 252 tests, no pytest required
 python3 tests/run_tests.py gpt sparse   # filter by module name
+python3 tests/run_tests.py lab          # just the LAB TESTING modules
 python3 tools/make_demo.py --out /tmp/revive-demo    # rebuild the fixtures
 ```
 
@@ -165,10 +190,13 @@ revive/
   firmware/  scatter, rawprogram, pac, da, detect
   ops/       plan, dump, verify, convert
   backends/  base, mtk_brom, qualcomm_edl, unisoc, fastboot, mock, usbfinder
+  lab_testing/   the virtual device laboratory: profiles, virtual eMMC, brick engine,
+                 scenarios, recovery grading, reports, its own CLI
   ui/        api.py, server.py, static/index.html
   cli.py     the `revive` command
 tools/       make_demo.py (synthetic fixtures)
 tests/       zero-dependency test suite
+docs/        lab-testing.md, dead-device-handshake-audit.md
 ```
 
 ## License
