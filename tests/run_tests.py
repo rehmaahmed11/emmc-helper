@@ -29,6 +29,7 @@ MODULES = [
     "test_firmware",
     "test_ops",
     "test_backends",
+    "test_dead_device_audit",
     "test_ui",
 ]
 

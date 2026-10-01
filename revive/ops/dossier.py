@@ -281,7 +281,8 @@ def _format_handshake_trace(intercept_res: Optional[InterceptResult],
             f"WDT Disabled        : {intercept_res.wdt_disabled}"
             + (f" (at 0x{intercept_res.wdt_address:08X})" if intercept_res.wdt_address else ""),
             f"Forced From Mode    : {intercept_res.forced_from_mode or 'direct catch'}",
-            f"Preloader -> BROM   : {intercept_res.preloader_crashed_to_brom}",
+            f"Preloader -> BROM   : crash payload sent={intercept_res.preloader_crashed_to_brom}, "
+            f"BROM re-captured={intercept_res.brom_recaptured}",
             "",
         ])
         if intercept_res.sync_bytes:
@@ -322,6 +323,20 @@ def _format_handshake_trace(intercept_res: Optional[InterceptResult],
     return "\n".join(lines)
 
 
+def _force_entry_summary(intercept_res: Optional[InterceptResult]) -> str:
+    """One line that never confuses 'crash payload sent' with 'BROM actually captured'."""
+    if intercept_res is None:
+        return "not recorded"
+    if intercept_res.brom_recaptured:
+        return "Preloader crash sent and BROM (0e8d:0003) re-captured + handshaken"
+    if intercept_res.preloader_crashed_to_brom:
+        return ("Preloader crash sent, but BROM did NOT re-appear - retry while holding "
+                "Volume Up + Volume Down, or power-cycle first")
+    if intercept_res.forced_from_mode:
+        return f"escalated from {intercept_res.forced_from_mode} (no direct catch)"
+    return "not requested / direct catch"
+
+
 def _format_recovery_checklist(platform_name: str,
                                device_info: Optional[DeviceInfo],
                                intercept_res: Optional[InterceptResult],
@@ -344,6 +359,7 @@ def _format_recovery_checklist(platform_name: str,
         f"Detected Mode  : {mode}",
         f"Watchdog Base  : 0x{wdt_base:08X} (WDT freeze {'ACTIVE' if (intercept_res and intercept_res.wdt_disabled) else 'ready'})",
         f"Security Flags : SBC={sbc}, SLA={sla}, DAA={daa}",
+        f"Force Entry    : {_force_entry_summary(intercept_res)}",
         "",
         "1. PRIORITY BACKUP (BEFORE WRITING ANYTHING)",
         "   Always back up this specific phone's radio/identity calibration partitions first:",
@@ -572,6 +588,7 @@ def save_device_dossier(
         "wdt_disabled": security_payload["wdt_disabled"],
         "forced_from_mode": intercept_result.forced_from_mode if intercept_result else "",
         "preloader_crashed_to_brom": bool(intercept_result and intercept_result.preloader_crashed_to_brom),
+        "brom_recaptured": bool(intercept_result and intercept_result.brom_recaptured),
         "capture_latency_ms": round(intercept_result.capture_latency_ms, 4) if intercept_result else 0.0,
         "scatter_file": str(scatter_path),
         "rawprogram_file": str(rawprogram_path),
