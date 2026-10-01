@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Revive working data: dumps, extracted images and the synthetic demo tree are large and
+# regenerable (`revive demo --out ...`), so they never belong in the repository.
+demo/
+*.img
+*.bin
+*.pac
+*.lz4
+*.sparse
+manifest.json
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
