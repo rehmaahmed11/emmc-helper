@@ -82,6 +82,11 @@ QCDM_SWITCH_TO_EDL_FRAMES: Tuple[bytes, ...] = (
     bytes.fromhex("3aa16e7e"),         # Legacy DLOAD command 0x3A
 )
 
+# Sahara packet types the interceptor must recognise by name (the backend module has the rest).
+SAHARA_HELLO = 0x01
+SAHARA_HELLO_RESPONSE = 0x02
+SAHARA_MAX_PACKET = 1024 * 1024
+
 # Sahara Command Mode IDs for device telemetry
 SAHARA_CMD_READY = 0x0B
 SAHARA_CMD_EXECUTE = 0x0D
@@ -92,6 +97,45 @@ SAHARA_CMD_SWITCH_MODE = 0x0C
 SAHARA_EXEC_SERIAL_NUM = 0x01
 SAHARA_EXEC_MSM_HW_ID = 0x02
 SAHARA_EXEC_OEM_PK_HASH = 0x03
+
+# MediaTek BROM command-status word (bytes [8:12] of a 16-byte response). The high byte is the
+# verdict: 0x00 success, 0x02 a security refusal, 0xC0/0xC1/0xD0 fatal. Chip generations differ in
+# endianness, so both readings are tried and only an unambiguous verdict is accepted.
+BROM_STATUS_OK = 0x00000000
+BROM_STATUS_HIGH_BYTE = {0x00: "ok", 0x02: "security", 0xC0: "fatal", 0xC1: "fatal", 0xD0: "fatal"}
+BROM_REFUSAL_HIGH_BYTES = frozenset({0x02, 0xC0, 0xC1, 0xD0})
+
+
+def parse_brom_status(response: bytes) -> Tuple[Optional[int], bool]:
+    """Decode the BROM command-status word into ``(value, ok)``.
+
+    Returns ``(None, False)`` when the response is too short to contain a status, so a truncated
+    reply is never mistaken for an acknowledgement. Only an exactly-zero status (either byte
+    order) counts as success, and only the documented refusal high-bytes count as a refusal -
+    everything else is reported as "not acknowledged" rather than invented.
+    """
+    if not response or len(response) < 12:
+        return None, False
+    big = int.from_bytes(response[8:12], "big")
+    little = int.from_bytes(response[8:12], "little")
+    if big == BROM_STATUS_OK or little == BROM_STATUS_OK:
+        return BROM_STATUS_OK, True
+    for value in (big, little):
+        if (value >> 24) in BROM_REFUSAL_HIGH_BYTES:
+            return value, False
+    return (big if (big >> 24) in BROM_STATUS_HIGH_BYTE else little), False
+
+
+def describe_brom_status(response: bytes) -> str:
+    """Human-readable one-liner for a BROM status response, used in events and errors."""
+    value, ok = parse_brom_status(response)
+    if value is None:
+        return f"short/absent status response ({len(response)} bytes)"
+    if ok:
+        return "status 0x00000000 (ok)"
+    verdict = BROM_STATUS_HIGH_BYTE.get(value >> 24)
+    label = f" ({verdict})" if verdict else ""
+    return f"status 0x{value:08X}{label}"
 
 DOWNLOAD_TARGET_MODES: Set[str] = {
     usbmodes.MODE_MTK_BROM,
@@ -160,6 +204,7 @@ class InterceptResult:
     wdt_address: Optional[int] = None
     forced_from_mode: str = ""
     preloader_crashed_to_brom: bool = False
+    brom_recaptured: bool = False
     escalation_actions: List[str] = field(default_factory=list)
     usb_bounces: List[Dict[str, str]] = field(default_factory=list)
     events: List[InterceptEvent] = field(default_factory=list)
@@ -184,6 +229,7 @@ class InterceptResult:
             "wdt_address": f"0x{self.wdt_address:08X}" if self.wdt_address is not None else None,
             "forced_from_mode": self.forced_from_mode,
             "preloader_crashed_to_brom": self.preloader_crashed_to_brom,
+            "brom_recaptured": self.brom_recaptured,
             "escalation_actions": list(self.escalation_actions),
             "usb_bounces": list(self.usb_bounces),
             "events": [e.to_dict() for e in self.events],
@@ -203,6 +249,7 @@ class UsbInterceptor:
                  force_brom: bool = False,
                  disable_wdt: bool = True,
                  max_sync_attempts: int = 250,
+                 io_timeout: float = 1.0,
                  verbose: bool = False):
         self.target_modes = set(target_modes or DOWNLOAD_TARGET_MODES)
         self.poll_interval = max(0.0, float(poll_interval))
@@ -210,8 +257,12 @@ class UsbInterceptor:
         self.force_brom = force_brom
         self.disable_wdt = disable_wdt
         self.max_sync_attempts = max(1, int(max_sync_attempts))
+        self.io_timeout = max(0.05, float(io_timeout))
         self.verbose = verbose
         self._start_ns = time.perf_counter_ns()
+        # Bytes a transport returned beyond what was asked for, kept per device so packet framing
+        # survives transports that coalesce reads (some drivers/serial shims do this).
+        self._read_overflow: Dict[int, bytes] = {}
 
     def _record(self, result: InterceptResult, stage: str, detail: str,
                 tx: bytes = b"", rx: bytes = b"") -> None:
@@ -360,6 +411,9 @@ class UsbInterceptor:
         handshake_start_ns = time.perf_counter_ns()
         try:
             result.endpoints = usbfinder.fast_open_device(device)
+            # A device object can be replaced between attempts; never let leftover bytes from a
+            # previous device be served as the first bytes of the new one's packet.
+            self._read_overflow.pop(id(device), None)
             self._record(
                 result, "claim",
                 f"claimed interface {result.endpoints.interface} "
@@ -375,10 +429,36 @@ class UsbInterceptor:
                 self.mtk_handshake_hammer(device, result.endpoints, result)
                 # Read HW code and target config right away while locked
                 self._mtk_probe_and_freeze(device, result.endpoints, result)
+                if mode == usbmodes.MODE_MTK_BROM:
+                    # Already at the lowest level: nothing to force, and saying "crashed" here
+                    # would be a lie. Record it so the trace shows the distinguishment.
+                    result.telemetry["already_brom"] = True
                 # If caught in Preloader (battery attached) and caller requested force_brom,
                 # crash Preloader to force SoC warm-reset into BROM 0e8d:0003!
                 if mode == usbmodes.MODE_MTK_PRELOADER and self.force_brom:
-                    self._crash_preloader_into_brom(device, result.endpoints, result)
+                    if not result.preloader_crashed_to_brom:
+                        self._crash_preloader_into_brom(device, result.endpoints, result)
+                    if not result.brom_recaptured:
+                        # The crash payload went out, but BROM never came back on the bus.
+                        # Do NOT report this as a locked BROM session: the caller must keep
+                        # spinning (or tell the user to retry/replug) rather than proceed
+                        # against a handle that no longer exists.
+                        result.ok = False
+                        result.handshake_duration_ms = (
+                            time.perf_counter_ns() - handshake_start_ns
+                        ) / 1_000_000.0
+                        result.device = None
+                        result.error = (
+                            "The device answered in Preloader but did not re-enumerate as BROM "
+                            "(0e8d:0003) after the force-BROM crash/reset. The crash payload was "
+                            "delivered; the SoC did not come back on the bus within the catch "
+                            "window."
+                        )
+                        self._record(
+                            result, "force_brom_unconfirmed",
+                            "no 0e8d:0003 after Preloader crash; not reporting a BROM lock",
+                        )
+                        return result
             elif mode == usbmodes.MODE_QC_EDL:
                 self.qualcomm_sahara_intercept(device, result.endpoints, result)
             elif mode == usbmodes.MODE_UNISOC:
@@ -387,9 +467,12 @@ class UsbInterceptor:
                 self._record(result, "lock", f"interface claimed in mode {mode}")
 
             result.ok = True
+            # An earlier failed attempt in the same intercept() run may have left an error
+            # string behind; a locked session must not carry it.
+            result.error = ""
             result.handshake_duration_ms = (time.perf_counter_ns() - handshake_start_ns) / 1_000_000.0
             # Only read USB string descriptors AFTER handshake is safely locked!
-            result.device_details = usbfinder.describe_device(device)
+            result.device_details = usbfinder.describe_device(result.device or device)
             return result
         except Exception as exc:
             result.ok = False
@@ -420,86 +503,112 @@ class UsbInterceptor:
             except Exception:
                 pass
 
-        # 2) Tight zero-sleep hammer for byte 0 (0xA0 -> 0x5F)
+        # 2) Tight zero-sleep hammer for byte 0 (0xA0 -> 0x5F). ONLY an exact 0x5F counts as a
+        #    lock: a boot ROM that answers something else (a stale session, a CDC echo, a dying
+        #    port) must never be reported as a captured handshake.
         first_tx, first_expect = MTK_SYNC_SEQUENCE[0]
-        got_first = False
         first_rx_byte: Optional[int] = None
+        noise: List[str] = []
+        attempts = 0
 
         # Check if the control transfer already queued a response byte in the IN endpoint
         try:
             pre_rx = bytes(device.read(eps.in_ep, 1, 20))
-            if pre_rx:
+        except Exception:
+            pre_rx = b""
+        if pre_rx:
+            if pre_rx[0] == first_expect:
                 first_rx_byte = pre_rx[0]
-                got_first = True
                 self._record(
                     result, "mtk_sync_0",
-                    f"wake response 0x{first_rx_byte:02x}",
+                    "0xA0 -> 0x5F locked by the wake-up control transfer",
                     tx=bytes([first_tx]), rx=pre_rx,
                 )
-        except Exception:
-            pass
+            else:
+                noise.append(f"wake transfer: 0x{pre_rx[0]:02X}")
 
-        if not got_first or (first_rx_byte != first_expect and self.max_sync_attempts > 1):
-            for attempt in range(1, self.max_sync_attempts + 1):
-                try:
-                    device.write(eps.out_ep, bytes([first_tx]), 25)
-                except Exception:
-                    pass
-                try:
-                    rx = bytes(device.read(eps.in_ep, 1, 25))
-                except Exception:
-                    rx = b""
-                if rx:
+        while first_rx_byte != first_expect and attempts < self.max_sync_attempts:
+            attempts += 1
+            try:
+                device.write(eps.out_ep, bytes([first_tx]), 25)
+            except Exception:
+                pass          # the port may be mid-reset; keep hammering until the deadline
+            try:
+                rx = bytes(device.read(eps.in_ep, 1, 25))
+            except Exception:
+                rx = b""
+            if rx:
+                if rx[0] == first_expect:
                     first_rx_byte = rx[0]
-                    if first_rx_byte == first_expect:
-                        got_first = True
-                        self._record(
-                            result, "mtk_sync_0",
-                            f"0xA0 -> 0x5F locked on attempt #{attempt}",
-                            tx=bytes([first_tx]), rx=rx,
-                        )
-                        break
-                    # If device returned a non-0x5F byte on attempt 1 (e.g. already synced or mock),
-                    # record it as fallback if no 0x5F arrives
-                    if not got_first:
-                        got_first = True
+                    self._record(
+                        result, "mtk_sync_0",
+                        f"0xA0 -> 0x5F locked on attempt #{attempts}",
+                        tx=bytes([first_tx]), rx=rx,
+                    )
+                    break
+                noise.append(f"#{attempts}: 0x{rx[0]:02X}")
 
-        if not got_first or first_rx_byte is None:
+        if first_rx_byte != first_expect:
+            seen = f" Last replies: {', '.join(noise[-4:])}." if noise else ""
             raise BackendError(
-                "MediaTek BROM/Preloader did not answer the 0xA0 sync hammer",
+                "MediaTek BROM/Preloader did not answer the 0xA0 sync hammer with 0x5F "
+                f"after {attempts} attempt(s).{seen}",
                 code="2005",
-                detail="The boot window closed or the USB port is stalled.",
+                detail="The boot window closed, the USB port is stalled, or the phone is not in "
+                       "BROM/Preloader any more. Power-cycle, start the operation first, then "
+                       "plug in while holding Volume Up + Volume Down.",
+                data={"attempts": attempts, "last_replies": noise[-4:]},
             )
 
         sync_pairs: List[Dict[str, str]] = [
             {"tx": f"0x{first_tx:02X}", "rx": f"0x{first_rx_byte:02X}", "expected": f"0x{first_expect:02X}"}
         ]
 
-        # 3) Complete the remaining 3 bytes of the 4-byte sync (0x0A->0xF5, 0x50->0xAF, 0x05->0xFA)
-        if first_rx_byte == first_expect:
-            for idx, (tx_b, exp_b) in enumerate(MTK_SYNC_SEQUENCE[1:], start=1):
-                try:
-                    device.write(eps.out_ep, bytes([tx_b]), 100)
-                    rx_b = bytes(device.read(eps.in_ep, 1, 100))
-                except Exception as exc:
-                    raise BackendError(
-                        f"BROM sync broke at byte #{idx} (0x{tx_b:02X}): {exc}",
-                        code="2005",
-                    )
-                if not rx_b:
-                    raise BackendError(
-                        f"BROM did not answer sync byte #{idx} (0x{tx_b:02X})",
-                        code="2005",
-                    )
-                sync_pairs.append({
-                    "tx": f"0x{tx_b:02X}",
-                    "rx": f"0x{rx_b[0]:02X}",
-                    "expected": f"0x{exp_b:02X}",
-                })
-                self._record(
-                    result, f"mtk_sync_{idx}",
-                    f"0x{tx_b:02X} -> 0x{rx_b[0]:02X} (expected 0x{exp_b:02X})",
-                    tx=bytes([tx_b]), rx=rx_b,
+        # 3) Complete the remaining 3 bytes of the 4-byte sync (0x0A->0xF5, 0x50->0xAF, 0x05->0xFA).
+        #    Every byte must match exactly; a mismatch means the sync is broken and the BROM has to
+        #    be caught again from the top.
+        for idx, (tx_b, exp_b) in enumerate(MTK_SYNC_SEQUENCE[1:], start=1):
+            try:
+                device.write(eps.out_ep, bytes([tx_b]), 100)
+                rx_b = bytes(device.read(eps.in_ep, 1, 100))
+            except Exception as exc:
+                result.sync_bytes = sync_pairs
+                raise BackendError(
+                    f"BROM sync broke at byte #{idx} (0x{tx_b:02X}): {exc}",
+                    code="2005",
+                    detail="The device stopped answering in the middle of the 4-byte sync; it "
+                           "likely dropped out of BROM/Preloader. Re-plug and retry.",
+                    data={"sync_pairs": sync_pairs},
+                )
+            if not rx_b:
+                result.sync_bytes = sync_pairs
+                raise BackendError(
+                    f"BROM did not answer sync byte #{idx} (0x{tx_b:02X})",
+                    code="2005",
+                    detail="The device stopped answering in the middle of the 4-byte sync; it "
+                           "likely dropped out of BROM/Preloader. Re-plug and retry.",
+                    data={"sync_pairs": sync_pairs},
+                )
+            sync_pairs.append({
+                "tx": f"0x{tx_b:02X}",
+                "rx": f"0x{rx_b[0]:02X}",
+                "expected": f"0x{exp_b:02X}",
+            })
+            self._record(
+                result, f"mtk_sync_{idx}",
+                f"0x{tx_b:02X} -> 0x{rx_b[0]:02X} (expected 0x{exp_b:02X})",
+                tx=bytes([tx_b]), rx=rx_b,
+            )
+            if rx_b[0] != exp_b:
+                result.sync_bytes = sync_pairs
+                raise BackendError(
+                    f"BROM sync byte #{idx} (0x{tx_b:02X}) answered 0x{rx_b[0]:02X}, "
+                    f"expected 0x{exp_b:02X} - the 4-byte sync did not lock",
+                    code="2005",
+                    detail="An unexpected sync byte means this is not a fresh BROM session (often "
+                           "a half-open session from a previous tool, or a different chip "
+                           "generation). Unplug the phone, wait 10 seconds and retry.",
+                    data={"sync_pairs": sync_pairs},
                 )
 
         result.sync_bytes = sync_pairs
@@ -507,31 +616,61 @@ class UsbInterceptor:
 
     def _mtk_probe_and_freeze(self, device: Any, eps: Endpoints,
                               result: InterceptResult) -> None:
-        """Read HW_CODE (0xFC) + TARGET_CONFIG (0xD4) and immediately disable the hardware WDT."""
+        """Read HW_CODE (0xFC) + TARGET_CONFIG (0xD4) and immediately disable the hardware WDT.
+
+        A response is only trusted when its command-status word says ``ok``. This matters more
+        than it looks: on a refusing (secure) device, reading the hwcode field out of an error
+        response would hand the user a *fabricated chip name* that they might download firmware
+        for. A refusal is recorded as a refusal instead.
+        """
         hwcode: Optional[int] = None
+        hwcode_refused = False
         try:
             device.write(eps.out_ep, b"\xFC", 250)
             resp = bytes(device.read(eps.in_ep, 16, 250))
-            if len(resp) >= 8:
-                hwcode = struct.unpack(">H", resp[6:8])[0]
-                chip = chips.lookup(hwcode)
-                result.telemetry["hwcode"] = f"0x{hwcode:04X}"
-                result.telemetry["hwcode_int"] = hwcode
-                result.telemetry["chip"] = chip.name if chip else f"unknown (0x{hwcode:04X})"
+            _status, ok = parse_brom_status(resp)
+            if len(resp) >= 8 and ok:
+                candidate = struct.unpack(">H", resp[6:8])[0]
+                if candidate:
+                    hwcode = candidate
+                    chip = chips.lookup(hwcode)
+                    result.telemetry["hwcode"] = f"0x{hwcode:04X}"
+                    result.telemetry["hwcode_int"] = hwcode
+                    result.telemetry["chip"] = chip.name if chip else f"unknown (0x{hwcode:04X})"
+                    self._record(
+                        result, "mtk_hwcode",
+                        f"read hwcode 0x{hwcode:04X} ({result.telemetry['chip']})",
+                        tx=b"\xFC", rx=resp,
+                    )
+            elif resp:
+                hwcode_refused = True
+                result.telemetry["hwcode_refused"] = describe_brom_status(resp)
                 self._record(
-                    result, "mtk_hwcode",
-                    f"read hwcode 0x{hwcode:04X} ({result.telemetry['chip']})",
+                    result, "mtk_hwcode_refused",
+                    "GET_HW_CODE refused - not reporting a chip identity: "
+                    + describe_brom_status(resp),
                     tx=b"\xFC", rx=resp,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            self._record(result, "mtk_hwcode_error", f"GET_HW_CODE failed: {exc}")
 
         try:
             device.write(eps.out_ep, b"\xD4", 250)
             resp = bytes(device.read(eps.in_ep, 16, 250))
-            if len(resp) >= 10:
-                if not hwcode:
-                    hwcode = struct.unpack(">H", resp[6:8])[0]
+            # The 0xD4 response carries hw_subcode/hw_version/target_config across bytes 4..12,
+            # so the same bytes that look like a status word hold payload here. We therefore read
+            # the fields, but only trust them when the reply is a full 16-byte frame.
+            if len(resp) >= 10 and resp.strip(b"\x00"):
+                # A refused GET_HW_CODE means this device gates identity reads; do not sneak the
+                # hwcode out of the target-config reply behind the gate's back.
+                if not hwcode and not hwcode_refused:
+                    candidate = struct.unpack(">H", resp[6:8])[0]
+                    if candidate:
+                        hwcode = candidate
+                        result.telemetry["hwcode"] = f"0x{candidate:04X}"
+                        result.telemetry["hwcode_int"] = candidate
+                        chip = chips.lookup(candidate)
+                        result.telemetry["chip"] = chip.name if chip else f"unknown (0x{candidate:04X})"
                 tcfg = struct.unpack(">H", resp[8:10])[0]
                 result.telemetry["target_config"] = f"0x{tcfg:04X}"
                 result.telemetry["sbc_enabled"] = bool(tcfg & 0x0001)
@@ -542,8 +681,8 @@ class UsbInterceptor:
                     f"target_config=0x{tcfg:04X} (SBC={bool(tcfg & 1)}, SLA={bool(tcfg & 2)}, DAA={bool(tcfg & 4)})",
                     tx=b"\xD4", rx=resp,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            self._record(result, "mtk_target_config_error", f"GET_TARGET_CONFIG failed: {exc}")
 
         if self.disable_wdt:
             self.disable_mtk_watchdog(device, eps, hwcode, result)
@@ -565,6 +704,26 @@ class UsbInterceptor:
             val_pkt = struct.pack(">I", wdt_val)
             device.write(eps.out_ep, val_pkt, 200)
             ack2 = bytes(device.read(eps.in_ep, 16, 200))
+            _s1, ok1 = parse_brom_status(ack1)
+            _s2, ok2 = parse_brom_status(ack2)
+            if not (ok1 and ok2):
+                # Do not claim a frozen BROM when the write was not acknowledged: without the WDT
+                # disabled the phone drops out of BROM within seconds.
+                if result is not None:
+                    result.wdt_disabled = False
+                    result.wdt_address = wdt_addr
+                    result.telemetry["wdt_error"] = (
+                        f"write command: {describe_brom_status(ack1)}; "
+                        f"data transfer: {describe_brom_status(ack2)}"
+                    )
+                    self._record(
+                        result, "wdt_disable_refused",
+                        f"watchdog write at 0x{wdt_addr:08X} was NOT acknowledged "
+                        f"({describe_brom_status(ack1)} / {describe_brom_status(ack2)}); "
+                        "BROM is not frozen",
+                        tx=cmd_pkt + val_pkt, rx=ack1 + ack2,
+                    )
+                return False
             if result is not None:
                 result.wdt_disabled = True
                 result.wdt_address = wdt_addr
@@ -618,10 +777,14 @@ class UsbInterceptor:
                 device.read(eps.in_ep, 16, 100)
             except Exception:
                 pass
-        except Exception:
-            pass
+            usbfinder.reset_device(device)
+        except Exception as exc:
+            self._record(
+                result, "force_brom_failed",
+                f"could not deliver the Preloader->BROM crash payload: {exc}",
+            )
+            return
 
-        usbfinder.reset_device(device)
         result.preloader_crashed_to_brom = True
         result.escalation_actions.append(
             f"crashed Preloader into BROM via WDT_SWRST (0x{swrst_addr:08X}=0x{swrst_val:04X})"
@@ -631,56 +794,172 @@ class UsbInterceptor:
             f"Preloader crash + WDT_SWRST (0x{swrst_addr:08X}=0x1209) sent; watching for 0e8d:0003"
         )
 
-        # If real libusb is active, spin briefly to catch the newly re-enumerated 0e8d:0003 BROM device
+        # If real libusb is active, spin briefly to catch the newly re-enumerated 0e8d:0003 BROM
+        # device. Only an actual re-catch + successful 4-byte sync counts as a forced BROM entry:
+        # the crash payload alone is an attempt, not an outcome.
         brom_dev = usbfinder.wait_for_device(0x0E8D, 0x0003, timeout=1.5, interval=0.0005)
-        if brom_dev is not None:
-            result.device = brom_dev
-            result.vid = 0x0E8D
-            result.pid = 0x0003
-            result.usb_id = "0e8d:0003"
-            result.mode = usbmodes.MODE_MTK_BROM
-            result.forced_from_mode = usbmodes.MODE_MTK_PRELOADER
-            result.endpoints = usbfinder.fast_open_device(brom_dev)
-            self.mtk_handshake_hammer(brom_dev, result.endpoints, result)
-            self._mtk_probe_and_freeze(brom_dev, result.endpoints, result)
+        if brom_dev is None:
+            self._record(
+                result, "force_brom_no_recapture",
+                "no 0e8d:0003 device appeared within 1.5 s of the crash/reset",
+            )
+            return
+
+        try:
+            eps_brom = usbfinder.fast_open_device(brom_dev)
+            self.mtk_handshake_hammer(brom_dev, eps_brom, result)
+            self._mtk_probe_and_freeze(brom_dev, eps_brom, result)
+        except Exception as exc:
+            self._record(
+                result, "force_brom_recapture_failed",
+                f"0e8d:0003 appeared but did not complete the BROM handshake: {exc}",
+            )
+            return
+
+        result.device = brom_dev
+        result.endpoints = eps_brom
+        result.vid = 0x0E8D
+        result.pid = 0x0003
+        result.usb_id = "0e8d:0003"
+        result.mode = usbmodes.MODE_MTK_BROM
+        result.forced_from_mode = usbmodes.MODE_MTK_PRELOADER
+        result.brom_recaptured = True
+        result.escalation_actions.append("re-caught 0e8d:0003 (BROM) and locked the 4-byte sync")
+        self._record(
+            result, "force_brom_recaptured",
+            "re-caught 0e8d:0003 (BROM), 4-byte sync locked and WDT handling applied",
+        )
 
     # ------------------------------------------------------------------
     # Qualcomm Sahara Instant Intercept + Command Mode Telemetry
     # ------------------------------------------------------------------
 
+    def _read_exact(self, device: Any, ep: int, length: int, timeout: float,
+                    result: Optional[InterceptResult] = None,
+                    stage: str = "") -> bytes:
+        """Read exactly `length` bytes, tolerating USB bulk short reads.
+
+        A single `device.read()` may return fewer bytes than asked for (this is normal on real
+        USB, and common on a phone whose PHY is brown-out flaky). Treating a short read as a
+        complete packet is how an EDL handshake gets "captured" while the session was never
+        actually locked, so this loops until the packet is complete or the deadline expires.
+        """
+        buf = bytearray()
+        key = id(device)
+        leftover = self._read_overflow.pop(key, b"")
+        if leftover:
+            buf += leftover[:length]
+            leftover = leftover[length:]
+            if leftover:
+                self._read_overflow[key] = leftover
+        deadline = time.perf_counter() + max(0.001, float(timeout))
+        while len(buf) < length:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            try:
+                chunk = bytes(device.read(ep, length - len(buf), int(min(remaining, 1.0) * 1000)))
+            except Exception:
+                chunk = b""
+            if chunk:
+                take = length - len(buf)
+                buf += chunk[:take]
+                if len(chunk) > take:
+                    self._read_overflow[key] = chunk[take:]
+                continue
+            time.sleep(0.0005)
+        if result is not None and stage and len(buf) < length:
+            self._record(
+                result, f"{stage}_short_read",
+                f"wanted {length} bytes, received {len(buf)} before the deadline",
+            )
+        return bytes(buf)
+
     def qualcomm_sahara_intercept(self, device: Any, eps: Endpoints,
                                   result: InterceptResult) -> Dict[str, Any]:
-        """Immediately capture the Sahara HELLO packet and read HW_ID / PK_HASH / Serial if available."""
-        try:
-            raw = bytes(device.read(eps.in_ep, 64, 500))
-        except Exception as exc:
-            raise BackendError(f"EDL port opened but Sahara HELLO read failed: {exc}", code="sahara_error")
+        """Capture the Sahara HELLO packet, verify it, and lock the session with HELLO_RESPONSE."""
+        header = self._read_exact(device, eps.in_ep, 8, self.io_timeout, result, "sahara_header")
+        if len(header) < 8:
+            raise BackendError(
+                "EDL port did not deliver a full 8-byte Sahara header "
+                f"({len(header)} bytes arrived); no handshake was captured",
+                code="sahara_error",
+                detail="The port is open but silent. A failed previous session can leave the "
+                       "device like this: unplug, wait 10 seconds, replug (a long power press "
+                       "also resets it).",
+            )
+        cmd, length = struct.unpack_from("<II", header, 0)
+        if length < 8 or length > SAHARA_MAX_PACKET:
+            raise BackendError(
+                f"implausible Sahara packet length {length} (command 0x{cmd:02x})",
+                code="sahara_error",
+                detail="The device is speaking something that is not the Sahara boot ROM "
+                       "protocol, or the port is a diagnostic interface rather than 9008.",
+                data={"command": f"0x{cmd:02x}", "length": length},
+            )
+        payload_len = length - 8
+        payload = (self._read_exact(device, eps.in_ep, payload_len,
+                                    self.io_timeout * (1 + payload_len // 65536),
+                                    result, "sahara_payload")
+                   if payload_len else b"")
+        if len(payload) < payload_len:
+            raise BackendError(
+                f"Sahara packet truncated: header promises {length} bytes, "
+                f"{len(payload) + 8} arrived",
+                code="sahara_error",
+                detail="A packet that stops mid-flight usually means the cable/port dropped or "
+                       "the boot ROM reset itself. Replug and retry.",
+                data={"command": f"0x{cmd:02x}", "length": length, "received": len(payload) + 8},
+            )
+        raw = header + payload
+        self._record(result, "sahara_packet",
+                     f"received Sahara packet cmd=0x{cmd:02x} len={length}", rx=raw)
 
-        if len(raw) < 8:
-            raise BackendError("EDL port returned an empty Sahara packet", code="sahara_error")
+        if cmd != SAHARA_HELLO:
+            name = {0x03: "READ_DATA", 0x04: "END_OF_IMAGE", 0x05: "DONE", 0x07: "RESET"}.get(
+                cmd, f"0x{cmd:02x}")
+            raise BackendError(
+                f"expected a Sahara HELLO (0x01) from EDL, got {name}",
+                code="sahara_error",
+                detail="The device is not at the start of a fresh Sahara session: another tool "
+                       "has already opened it, or this is not the 9008 loader interface. Unplug, "
+                       "wait 10 seconds, replug, then retry.",
+                data={"command": f"0x{cmd:02x}"},
+            )
 
-        cmd, length = struct.unpack_from("<II", raw, 0)
-        payload = raw[8:8 + max(0, length - 8)] if length >= 8 else raw[8:]
-        self._record(result, "sahara_hello", f"received Sahara packet cmd=0x{cmd:02x} len={length}", rx=raw)
-
-        if cmd == 0x01 and len(payload) >= 16:
+        if len(payload) >= 16:
             version, min_version, max_pkt, mode = struct.unpack_from("<IIII", payload, 0)
-            result.telemetry["sahara_version"] = version
-            result.telemetry["sahara_min_version"] = min_version
-            result.telemetry["sahara_max_packet"] = max_pkt
-            result.telemetry["sahara_mode"] = mode
+        else:
+            # Very old boot ROMs answer with a shorter HELLO; use the documented safe defaults
+            # rather than refusing to lock, and say so in the telemetry.
+            version = min_version = mode = 0
+            max_pkt = 1024
+            result.telemetry["sahara_legacy_hello"] = True
+        result.telemetry["sahara_version"] = version
+        result.telemetry["sahara_min_version"] = min_version
+        result.telemetry["sahara_max_packet"] = max_pkt
+        result.telemetry["sahara_mode"] = mode
 
-            # Send HELLO_RESPONSE (0x02) echoing mode to lock the Sahara session before PBL timer expires
-            hello_resp = struct.pack("<IIIIII", 0x02, 48, version, min_version, max_pkt, mode) + b"\x00" * 24
-            try:
-                device.write(eps.out_ep, hello_resp, 300)
-                self._record(
-                    result, "sahara_hello_resp",
-                    f"locked Sahara v{version} session (mode={mode})",
-                    tx=hello_resp,
-                )
-            except Exception:
-                pass
+        # Send HELLO_RESPONSE (0x02) echoing mode to lock the Sahara session before the PBL timer
+        # expires. If this write does not go out, the handshake was NOT captured - say so instead
+        # of returning a success.
+        hello_resp = struct.pack("<IIIIII", SAHARA_HELLO_RESPONSE, 48,
+                                 version, min_version, max_pkt, mode) + b"\x00" * 24
+        try:
+            device.write(eps.out_ep, hello_resp, 300)
+        except Exception as exc:
+            raise BackendError(
+                f"Sahara HELLO arrived but the HELLO_RESPONSE (session lock) could not be sent: {exc}",
+                code="sahara_error",
+                detail="The port went away mid-handshake. Replug the phone and retry.",
+                data={"sahara": dict(result.telemetry)},
+            )
+        result.telemetry["sahara_session_locked"] = True
+        self._record(
+            result, "sahara_hello_resp",
+            f"locked Sahara v{version} session (mode={mode})",
+            tx=hello_resp,
+        )
         return result.telemetry
 
     # ------------------------------------------------------------------
@@ -747,19 +1026,25 @@ class UsbInterceptor:
         # Try Qualcomm EDL fastboot OEM commands first, then plain reboot (which lets our MTK
         # 0xA0 hammer catch BROM/Preloader on the reboot edge).
         commands = ("oem edl", "reboot-edl", "oem enter-dload", "oem reboot-edl", "reboot")
+        accepted = False
         for cmd in commands:
             try:
                 raw_cmd = cmd.encode("ascii")
                 device.write(eps.out_ep, raw_cmd, 250)
                 resp = bytes(device.read(eps.in_ep, 64, 250))
                 status = resp[:4].decode("ascii", "replace")
-                action = f"fastboot `{cmd}` -> {status}"
+                action = f"fastboot `{cmd}` -> {status or '(no reply)'}"
                 result.escalation_actions.append(action)
                 self._record(result, "fastboot_escalate", action, tx=raw_cmd, rx=resp)
                 if status == "OKAY":
+                    accepted = True
                     break
             except Exception:
                 continue
+        if not accepted:
+            action = "fastboot: none of the EDL/reboot transition commands was accepted"
+            result.escalation_actions.append(action)
+            self._record(result, "fastboot_escalate_failed", action)
 
     def _escalate_from_qcdm_diag(self, device: Any, result: InterceptResult) -> None:
         """Send QCDM diagnostic switch-to-EDL frames to flip `05c6:9006` into `05c6:9008`."""

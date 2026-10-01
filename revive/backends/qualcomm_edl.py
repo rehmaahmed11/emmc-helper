@@ -185,9 +185,25 @@ class QualcommEdlBackend(DeviceBackend):
         self.log_line("opened EDL interface")
 
     # -- Sahara -----------------------------------------------------------------------
-    def _read_exact(self, length: int) -> bytes:
-        data = self.device.read(self.endpoints["cmd_in"], length, self.timeout * 1000)
-        return bytes(data) if data else b""
+    def _read_exact(self, length: int, timeout: Optional[float] = None) -> bytes:
+        """Read exactly `length` bytes, looping over USB short reads until the deadline.
+
+        A bulk read returning less than requested is normal on real USB; treating it as a whole
+        packet turns a half-received Sahara frame into a bogus parse or a phantom "session".
+        """
+        buf = bytearray()
+        deadline = time.time() + (timeout if timeout is not None else self.timeout)
+        while len(buf) < length and time.time() < deadline:
+            try:
+                chunk = self.device.read(self.endpoints["cmd_in"], length - len(buf),
+                                         int(min(0.5, max(0.05, deadline - time.time())) * 1000))
+            except Exception:
+                chunk = b""
+            if chunk:
+                buf += bytes(chunk)[: length - len(buf)]
+                continue
+            time.sleep(0.001)
+        return bytes(buf)
 
     def read_sahara_packet(self) -> Dict[str, Any]:
         header = self._read_exact(8)
@@ -196,9 +212,23 @@ class QualcommEdlBackend(DeviceBackend):
                               detail="A failed previous session can leave the device like this; "
                                      "unplug, wait, replug (a long press on power also resets it).")
         command, length = struct.unpack("<II", header)
-        if length > 1024 * 1024:
-            raise BackendError(f"implausible Sahara packet length {length}", code="sahara_error")
-        payload = self._read_exact(length) if length else b""
+        if length < 8 or length > 1024 * 1024:
+            raise BackendError(
+                f"implausible Sahara packet length {length} (command 0x{command:02x})",
+                code="sahara_error",
+                detail="The device is not speaking the Sahara protocol on this interface, or the "
+                       "port is a diagnostic interface rather than 9008.",
+                data={"command": f"0x{command:02x}", "length": length},
+            )
+        payload = self._read_exact(length - 8) if length > 8 else b""
+        if length > 8 and len(payload) < length - 8:
+            raise BackendError(
+                f"Sahara packet truncated: header promises {length} bytes, "
+                f"{len(payload) + 8} arrived",
+                code="sahara_error",
+                detail="A packet that stops mid-flight usually means the cable/port dropped or "
+                       "the boot ROM reset itself. Replug and retry.",
+            )
         return {"command": command, "name": SAHARA_NAMES.get(command, f"0x{command:02x}"),
                 "length": length, "payload": payload}
 

@@ -150,6 +150,7 @@ class MtkBromBackend(DeviceBackend):
                 "wdt_disabled": res.wdt_disabled,
                 "forced_from_mode": res.forced_from_mode,
                 "preloader_crashed_to_brom": res.preloader_crashed_to_brom,
+                "brom_recaptured": res.brom_recaptured,
             }
             self.log_line(f"intercepted {self.info.usb_id} in {res.capture_latency_ms:.3f} ms")
             return
@@ -181,7 +182,16 @@ class MtkBromBackend(DeviceBackend):
         self.eps = usbfinder.fast_open_device(device)
         self.handshake()
         if self.force_brom and self.info.mode == usbmodes.MODE_MTK_PRELOADER:
-            self.crash_preloader_to_brom()
+            if not self.crash_preloader_to_brom():
+                self.log_line(
+                    "force_brom: the crash payload was sent but no BROM (0e8d:0003) was re-caught; "
+                    "still speaking to the Preloader session"
+                )
+                self.info.notes.append(
+                    "force_brom was requested but the phone did not re-enumerate as BROM "
+                    "(0e8d:0003) after the Preloader crash. Everything below was read from the "
+                    "Preloader session, not from BROM."
+                )
 
     def handshake(self, max_attempts: int = 80) -> List[Dict[str, str]]:
         """Execute the zero-sleep 4-byte inverse sync (`0xA0 0x0A 0x50 0x05` -> `0x5F 0xF5 0xAF 0xFA`)."""
@@ -226,19 +236,29 @@ class MtkBromBackend(DeviceBackend):
             return False
 
     def crash_preloader_to_brom(self) -> bool:
-        """Crash an active Preloader session (`0e8d:2000`) to force warm-reset into BROM (`0e8d:0003`)."""
+        """Crash an active Preloader session (`0e8d:2000`) to force warm-reset into BROM (`0e8d:0003`).
+
+        Returns True only when the phone was actually re-caught as BROM and the 4-byte sync was
+        locked on the new handle. Sending the crash payload is an attempt, not a result: a phone
+        whose PMIC stays off, or that re-enters Preloader, must not be reported as "in BROM".
+        """
         engine = interceptor_mod.UsbInterceptor(force_brom=True, verbose=self.verbose)
         res = self.intercept_result or interceptor_mod.InterceptResult()
         engine._crash_preloader_into_brom(self.device, self.eps, res)
         self.intercept_result = res
-        if res.mode == usbmodes.MODE_MTK_BROM and res.device is not None:
+        if res.brom_recaptured and res.device is not None:
             self.device = res.device
             self.eps = res.endpoints
             self.info.mode = usbmodes.MODE_MTK_BROM
             self.info.usb_id = "0e8d:0003"
             self.log_line("Preloader crashed and re-caught in BROM (0e8d:0003)")
             return True
-        return res.preloader_crashed_to_brom
+        self.log_line(
+            "Preloader crash sent but BROM was not re-caught "
+            f"(preloader_crashed_to_brom={res.preloader_crashed_to_brom}, "
+            f"brom_recaptured={res.brom_recaptured})"
+        )
+        return False
 
     # -- low level --------------------------------------------------------------------
     def _send(self, command: int, payload: bytes = b"") -> None:
@@ -249,8 +269,13 @@ class MtkBromBackend(DeviceBackend):
 
     def _parse_status(self, response: bytes) -> Tuple[int, str]:
         """Return (status_value, endian_used). See module docstring for why this is adaptive."""
-        if len(response) < 10:
-            raise BackendError(f"short status response ({len(response)} bytes)", code="1042")
+        if len(response) < 12:
+            raise BackendError(
+                f"short status response ({len(response)} bytes, need 12 to hold the status word)",
+                code="1042",
+                detail="The device answered with fewer bytes than a BROM status header. Re-plug "
+                       "and retry; repeated short answers usually mean a stalled port.",
+            )
         candidates = {
             "big": int.from_bytes(response[8:12], "big"),
             "little": int.from_bytes(response[8:12], "little"),

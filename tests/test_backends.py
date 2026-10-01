@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import List
 
-from fixtures import demo_tree
+from fixtures import demo_tree, patched
 from revive import backends
 from revive.backends import interceptor, usbfinder
 from revive.core import usbmodes
@@ -227,11 +227,15 @@ def test_mtk_4byte_sync_hammer_and_wdt_disable():
 
 
 def test_mtk_preloader_force_brom_crash():
+    """The crash payload must go out - but with no BROM re-catch, success must NOT be claimed."""
     fake_pl = FakeMtkUsbDevice(vid=0x0E8D, pid=0x2000, ignore_first_a0=1, hwcode=0x0766)
     engine = interceptor.UsbInterceptor(force_brom=True, disable_wdt=True)
-    res = engine.intercept(timeout=0.5, injected_device=fake_pl)
-    assert res.ok is True
-    assert res.preloader_crashed_to_brom is True
+    with patched(usbfinder, wait_for_device=lambda *a, **k: None):   # BROM never re-enumerates
+        res = engine.intercept(timeout=0.5, injected_device=fake_pl)
+    assert res.preloader_crashed_to_brom is True, "sending the crash payload must be recorded"
+    assert res.brom_recaptured is False
+    assert res.ok is False, "without a BROM re-catch this is not a locked BROM session"
+    assert "BROM" in (res.error or "")
     assert fake_pl.was_reset is True
     assert any("WDT_SWRST" in act for act in res.escalation_actions)
 
