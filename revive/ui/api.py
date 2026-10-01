@@ -17,7 +17,7 @@ from .. import util
 from ..backends import describe_backends, get_backend, intercept_and_capture
 from ..core import chips, errors, usbmodes
 from ..firmware import detect as fw_detect
-from ..ops import convert, dossier, dump, plan, verify
+from ..ops import convert, device_archive, dossier, dump, plan, verify
 from ..storage import bootimg, ext4fs, gpt, lz4blk, magic, sparse, superimg
 
 
@@ -88,6 +88,17 @@ def drivers(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
 # Device work
 # --------------------------------------------------------------------------------------
 
+# Rule 1 (RULES.md): read info is saved when a device CONNECTS, not on every poll. The web UI
+# polls `detect` continuously, so the server keeps the identities currently present; a new
+# identity appearing in a poll means a device just connected (or re-connected).
+_SEEN_DEVICE_IDS: set = set()
+
+
+def reset_seen_devices() -> None:
+    """Forget which devices are present (used by tests; also called on server restarts)."""
+    _SEEN_DEVICE_IDS.clear()
+
+
 def detect(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     from ..backends import detect as backend_detect
 
@@ -105,6 +116,28 @@ def detect(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
             "power_hint": "No cable needed in demo mode.",
         })
         data["suggested_backend"] = data.get("suggested_backend") or "mock"
+    if not payload.get("no_archive"):
+        seen = _SEEN_DEVICE_IDS
+        current: set = set()
+        saved = []
+        for dev in data["devices"]:
+            ident = device_archive.identity_of(dev)
+            current.add(ident)
+            if ident not in seen:
+                try:
+                    saved.append(device_archive.archive_read_info(dev, source="ui.detect"))
+                except Exception as exc:
+                    saved.append({"ok": False, "error": str(exc)})
+        # Forget what is no longer plugged in, so a re-connect archives a fresh file.
+        seen.clear()
+        seen.update(current)
+        if saved:
+            data["device_archive"] = {
+                "root": str(device_archive.default_archive_root()),
+                "saved": len(saved),
+                "files": [a.get("file") for a in saved if a.get("ok")],
+                "errors": [a.get("error") for a in saved if not a.get("ok")],
+            }
     return data
 
 
@@ -127,14 +160,14 @@ def identify(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     try:
         backend.open()
         info_obj = backend.identify()
+        parts = []
+        try:
+            parts = backend.list_partitions()
+        except Exception:
+            parts = []
         out_dir = payload.get("out")
         dossier_info = None
         if out_dir:
-            parts = []
-            try:
-                parts = backend.list_partitions()
-            except Exception:
-                parts = []
             dossier_info = dossier.save_device_dossier(
                 out_dir=out_dir,
                 device_info=info_obj,
@@ -147,6 +180,15 @@ def identify(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
                "warnings": backend.guard_tested()}
         if dossier_info:
             res["dossier"] = dossier_info
+        if not payload.get("no_archive"):
+            # Rule 1 (RULES.md): identify reads the hardware -> save the read info.
+            try:
+                res["device_archive"] = device_archive.archive_read_info(
+                    info_obj.to_dict(), source="ui.identify",
+                    partitions=[p.to_dict() for p in parts],
+                )
+            except Exception as exc:
+                res["device_archive"] = {"ok": False, "error": str(exc)}
         return res
     except Exception as exc:
         return _error(exc)
@@ -172,6 +214,8 @@ def intercept(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
         out_dir=out_dir,
         demo=demo_mode,
         storage_path=ctx.get("demo_storage"),
+        archive=not payload.get("no_archive"),
+        archive_root=payload.get("archive_root"),
     )
 
 
@@ -179,6 +223,25 @@ def dossier_list(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]
     """List all connected/handshaked devices recorded in the dossier folder."""
     out_dir = payload.get("out") or payload.get("path") or dossier.DEFAULT_DOSSIER_DIR
     return dossier.list_dossiers(out_dir)
+
+
+def devices_list(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """List the device archive (Rule 1): every device folder with read-info and dump counts."""
+    root = payload.get("root") or payload.get("archive_root")
+    return device_archive.list_devices(root)
+
+
+def devices_dump(payload: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Place a full dump file into a device's full_dump/ folder (Rule 1)."""
+    device = payload.get("device")
+    src = payload.get("file") or payload.get("path")
+    if not device or not src:
+        return {"ok": False, "error": "device and file are required"}
+    try:
+        return device_archive.archive_dump_file(
+            str(src), root=payload.get("root") or payload.get("archive_root"), device=str(device))
+    except (ValueError, FileNotFoundError) as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 # --------------------------------------------------------------------------------------
@@ -635,6 +698,8 @@ ROUTES: Dict[str, Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = 
     "identify": identify,
     "intercept": intercept,
     "dossier.list": dossier_list,
+    "devices.list": devices_list,
+    "devices.dump": devices_dump,
     "inspect": inspect,
     "plan": plan_flash,
     "dump.analyse": dump_analyse,
@@ -667,7 +732,7 @@ ROUTES: Dict[str, Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = 
 
 # Routes that touch the filesystem or a device - the UI asks for confirmation on these.
 MUTATING = {"dump.extract", "gpt.repair", "convert", "super.extract", "manifest.create",
-            "demo.build", "intercept",
+            "demo.build", "intercept", "devices.dump",
             # The lab writes files (virtual device images) but never touches hardware.
             "lab.create", "lab.brick", "lab.repair", "lab.reset", "lab.run", "lab.report",
             "lab.delete", "lab.set"}

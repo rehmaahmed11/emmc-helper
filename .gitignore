@@ -21,6 +21,9 @@ manifest.json
 # Regenerable with `python -m revive.lab_testing create ...`, so it stays out of the repo.
 lab_devices/
 
+# Per-session handshake dossiers (default --out of `revive intercept`/`identify`).
+revive_handshakes/
+
 # Editors / OS
 .idea/
 .vscode/

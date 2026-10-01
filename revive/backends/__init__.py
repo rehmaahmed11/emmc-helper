@@ -182,6 +182,17 @@ def suggest_next_steps(result: DetectionResult) -> List[str]:
     return steps
 
 
+def _archive_read_info(device_archive, info: Dict[str, Any],
+                       archive: bool, archive_root: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Rule 1 (RULES.md): an intercepted handshake is a hardware read -> save its read info."""
+    if not archive:
+        return None
+    try:
+        return device_archive.archive_read_info(info, root=archive_root, source="intercept")
+    except Exception as exc:  # archiving must never break a capture
+        return {"ok": False, "error": str(exc)}
+
+
 def intercept_and_capture(
     backend_name: str = "auto",
     timeout: float = 20.0,
@@ -192,9 +203,11 @@ def intercept_and_capture(
     storage_path: Optional[Path] = None,
     verbose: bool = False,
     injected_device: Any = None,
+    archive: bool = True,
+    archive_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the sub-ms interceptor, identify the device, and save the full handshake + scatter dossier."""
-    from ..ops import dossier
+    from ..ops import device_archive, dossier
 
     if demo or backend_name == "mock":
         mock_b = MockBackend(storage_path=storage_path, verbose=verbose)
@@ -231,6 +244,7 @@ def intercept_and_capture(
                 partitions=parts,
                 backend_log=mock_b.log,
             )
+        device_archive_info = _archive_read_info(device_archive, info.to_dict(), archive, archive_root)
         mock_b.close()
         return {
             "ok": True,
@@ -238,6 +252,7 @@ def intercept_and_capture(
             "device": info.to_dict(),
             "partitions": [p.to_dict() for p in parts],
             "dossier": dossier_info,
+            "device_archive": device_archive_info,
         }
 
     # Map backend_name filter to target modes
@@ -262,6 +277,7 @@ def intercept_and_capture(
             "error": res.error or "Handshake interception timed out.",
             "interception": res.to_dict(),
             "dossier": None,
+            "device_archive": None,
         }
 
     # Build DeviceInfo from the intercepted telemetry + backend identify if possible
@@ -310,4 +326,5 @@ def intercept_and_capture(
         "device": dev_info.to_dict(),
         "partitions": [],
         "dossier": dossier_info,
+        "device_archive": _archive_read_info(device_archive, dev_info.to_dict(), archive, archive_root),
     }

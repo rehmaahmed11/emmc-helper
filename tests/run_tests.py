@@ -22,6 +22,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tests"))
 
+# The device archive (Rule 1) is exercised by the CLI and UI tests; point it at a throwaway
+# directory so test runs never write into the developer's real archive.
+_ARCHIVE_TEST_ROOT = Path(tempfile.mkdtemp(prefix="revive-archive-test-"))
+os.environ.setdefault("REVIVE_DEVICE_ARCHIVE", str(_ARCHIVE_TEST_ROOT))
+
 MODULES = [
     "test_util",
     "test_errors",
@@ -29,6 +34,7 @@ MODULES = [
     "test_storage",
     "test_firmware",
     "test_ops",
+    "test_device_archive",
     "test_backends",
     "test_dead_device_audit",
     "test_ui",

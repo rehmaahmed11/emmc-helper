@@ -18,7 +18,7 @@ from . import util
 from .backends import describe_backends, get_backend, intercept_and_capture
 from .core import chips, errors, usbmodes
 from .firmware import detect as fw_detect
-from .ops import convert, dossier, dump, plan as plan_mod, verify
+from .ops import convert, device_archive, dossier, dump, plan as plan_mod, verify
 from .storage import bootimg, gpt, magic, sparse, superimg
 from .util import human_size
 
@@ -136,6 +136,17 @@ def cmd_detect(args) -> int:
                 out_dir=args.out, device_info=dinfo, extra_devices=result.devices
             ))
         payload["dossiers"] = saved
+    if not getattr(args, "no_archive", False) and result.devices:
+        # Rule 1 (RULES.md): every hardware read saves a timestamped read-info file
+        # inside the device's own archive folder. Nothing is ever overwritten.
+        archived = []
+        for dev in result.devices:
+            try:
+                archived.append(device_archive.archive_read_info(
+                    dev, root=args.archive_root, source="detect"))
+            except Exception as exc:
+                archived.append({"ok": False, "error": str(exc)})
+        payload["device_archive"] = archived
     if args.json:
         print(json.dumps(payload, indent=2))
         return 0
@@ -156,10 +167,83 @@ def cmd_detect(args) -> int:
             print(f"    {port['port']:<16} {port['description'][:50]:<50} {port.get('likely','')}")
     if payload.get("dossiers"):
         print(f"\nSaved {len(payload['dossiers'])} device dossier(s) to {args.out}")
+    for item in payload.get("device_archive") or []:
+        if item.get("ok"):
+            tag = "new device folder" if item.get("created") else "read info appended"
+            print(f"\nDevice archive [{tag}]: {item['device_name']}")
+            print(f"    read info : {item['file']}")
+            if item.get("partitions_file"):
+                print(f"    partitions: {item['partitions_file']}")
+        else:
+            print(C(f"\n  device archive: {item.get('error')}", "yellow"))
     print("\nNext steps:")
     for step in result.suggested_actions:
         print(f"  - {step}")
     return 0
+
+
+def cmd_devices(args) -> int:
+    """Device archive (Rule 1 of RULES.md): one folder per device, read info per connection."""
+    action = getattr(args, "devices_command", None) or "list"
+    try:
+        if action == "list":
+            data = device_archive.list_devices(args.archive_root)
+            if getattr(args, "json", False):
+                print(json.dumps(data, indent=2))
+                return 0
+            if not data["devices"]:
+                print(C(f"No devices archived yet under {data['root']}.", "yellow"))
+                print("Plug in a phone and run:  revive detect   (or revive identify)")
+                return 0
+            print(f"{'DEVICE':<36} {'USB ID':<12} {'CHIP':<20} {'READ INFO':<10} {'DUMPS':<6} LAST SEEN")
+            print("-" * 108)
+            for d in data["devices"]:
+                print(f"{d['name'][:36]:<36} {str(d.get('usb_id') or '-')[:12]:<12} "
+                      f"{str(d.get('chip') or '-')[:20]:<20} {d.get('read_info_count', 0):<10} "
+                      f"{d.get('full_dump_count', 0):<6} {d.get('last_seen') or '-'}")
+            print(f"\nArchive root: {data['root']}")
+            return 0
+        if action == "show":
+            folder = device_archive.resolve_device_dir(args.archive_root, args.device)
+            record = json.loads((folder / "device.json").read_text(encoding="utf-8"))
+            if getattr(args, "json", False):
+                record["files"] = sorted(str(p.relative_to(folder)) for p in folder.rglob("*")
+                                         if p.is_file())
+                print(json.dumps(record, indent=2))
+                return 0
+            print(f"{C(record.get('name', folder.name), 'bold')}")
+            print(f"    folder   : {folder}")
+            for key in ("usb_id", "vid", "pid", "manufacturer", "product", "serial",
+                        "backend", "chip", "hwcode", "storage", "storage_size"):
+                value = record.get(key)
+                if value not in (None, ""):
+                    print(f"    {key + ':':<10} {value}")
+            print(f"    first seen: {record.get('first_seen')}\n    last seen : {record.get('last_seen')}")
+            print(f"    connects  : {record.get('connects', 0)}   read info files: "
+                  f"{record.get('read_info_files', 0)}   full dumps: {record.get('full_dumps', 0)}")
+            print("\n  Files:")
+            for sub in ("read_info", "full_dump", "partitions", "notes"):
+                d = folder / sub
+                if not d.is_dir():
+                    continue
+                files = sorted(d.iterdir())
+                print(f"    {sub + '/':<12} {len(files)} file(s)")
+                for f in files[-10:]:
+                    size = f.stat().st_size if f.is_file() else 0
+                    print(f"      {f.name}  ({util.human_size(size)})")
+            return 0
+        if action == "dump":
+            res = device_archive.archive_dump_file(
+                args.file, root=args.archive_root, device=args.device)
+            kind = "hard link" if res.get("linked") else "copy"
+            print(f"Saved full dump [{kind}] to: {res['file']}  ({util.human_size(res.get('size'))})")
+            print(f"Device folder: {res['device_folder']}")
+            return 0
+        raise ValueError(f"unknown devices action: {action}")
+    except ValueError as exc:
+        return fail(str(exc))
+    except FileNotFoundError as exc:
+        return fail(str(exc))
 
 
 def cmd_intercept(args) -> int:
@@ -173,6 +257,8 @@ def cmd_intercept(args) -> int:
         demo=bool(getattr(args, "demo", False)),
         storage_path=Path(args.storage) if getattr(args, "storage", None) else None,
         verbose=bool(getattr(args, "verbose", False)),
+        archive=not getattr(args, "no_archive", False),
+        archive_root=args.archive_root,
     )
     if args.json:
         print(json.dumps(res, indent=2))
@@ -212,6 +298,13 @@ def cmd_intercept(args) -> int:
         print(f"    Trace      : {dos['handshake_trace_file']}")
         print(f"    Checklist  : {dos['recovery_checklist_file']}")
         print(f"    Master Idx : {dos['index_file']}")
+    arch = res.get("device_archive")
+    if arch and arch.get("ok"):
+        tag = "new device folder" if arch.get("created") else "read info appended"
+        print(f"\n  {C(f'Device Archive [{tag}]:', 'bold')} {arch['device_name']}")
+        print(f"    read info : {arch['file']}")
+    elif arch:
+        print(C(f"  device archive: {arch.get('error')}", "yellow"))
     return 0
 
 
@@ -265,6 +358,16 @@ def cmd_identify(args) -> int:
                 partitions=parts,
                 backend_log=backend.log,
             )
+        archive_info = None
+        if not getattr(args, "no_archive", False):
+            # Rule 1 (RULES.md): identify is a hardware read -> save it to the device archive.
+            try:
+                archive_info = device_archive.archive_read_info(
+                    info.to_dict(), root=args.archive_root, source="identify",
+                    partitions=[p.to_dict() for p in parts],
+                )
+            except Exception as exc:
+                archive_info = {"ok": False, "error": str(exc)}
         if args.json:
             pay: Dict[str, Any] = {
                 "device": info.to_dict(),
@@ -273,6 +376,8 @@ def cmd_identify(args) -> int:
             }
             if dossier_info:
                 pay["dossier"] = dossier_info
+            if archive_info:
+                pay["device_archive"] = archive_info
             print(json.dumps(pay, indent=2))
             return 0
         print(f"{C(info.chip or 'Device', 'bold')}  ({backend.label})")
@@ -282,6 +387,14 @@ def cmd_identify(args) -> int:
         if dossier_info:
             print(f"\n  Saved handshake & scatter dossier to: {dossier_info['dossier_dir']}")
             print(f"    scatter: {dossier_info['scatter_file']}")
+        if archive_info and archive_info.get("ok"):
+            tag = "new device folder" if archive_info.get("created") else "read info appended"
+            print(f"\n  Device archive [{tag}]: {archive_info['device_name']}")
+            print(f"    read info : {archive_info['file']}")
+            if archive_info.get("partitions_file"):
+                print(f"    partitions: {archive_info['partitions_file']}")
+        elif archive_info:
+            print(C(f"\n  device archive: {archive_info.get('error')}", "yellow"))
         return 0
     except Exception as exc:
         return fail(str(exc), code=getattr(exc, "code", ""),
@@ -737,8 +850,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("detect", help="what is connected, and what to do next")
     p.add_argument("--out", help="save a handshake/device dossier folder for each connected device")
+    p.add_argument("--archive-root",
+                   help="device archive root (default: $REVIVE_DEVICE_ARCHIVE or ~/.revive/devices)")
+    p.add_argument("--no-archive", action="store_true",
+                   help="do not save read info to the device archive (Rule 1)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_detect)
+
+    p = sub.add_parser("devices",
+                       help="device archive (Rule 1): one folder per device, read info per connection")
+    p.add_argument("--archive-root",
+                   help="device archive root (default: $REVIVE_DEVICE_ARCHIVE or ~/.revive/devices)")
+    dev_sub = p.add_subparsers(dest="devices_command")
+    d = dev_sub.add_parser("list", help="list every device folder in the archive")
+    d.add_argument("--json", action="store_true")
+    d = dev_sub.add_parser("show", help="show one device's identity record and files")
+    d.add_argument("device", help="device folder name (or unique prefix of it)")
+    d.add_argument("--json", action="store_true")
+    d = dev_sub.add_parser("dump", help="place a full dump file into a device's full_dump/ folder")
+    d.add_argument("device", help="device folder name (or unique prefix of it)")
+    d.add_argument("file", help="the full dump file to archive")
+    p.set_defaults(func=cmd_devices)
 
     p = sub.add_parser("intercept",
                        help="sub-ms handshake interceptor + force BROM/EDL entry + auto scatter dossier")
@@ -754,6 +886,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default=dossier.DEFAULT_DOSSIER_DIR,
                    help="folder to save all connected handshakes, scatter & device details")
     p.add_argument("--no-save", action="store_true", help="do not write the handshake dossier folder")
+    p.add_argument("--archive-root",
+                   help="device archive root (default: $REVIVE_DEVICE_ARCHIVE or ~/.revive/devices)")
+    p.add_argument("--no-archive", action="store_true",
+                   help="do not save read info to the device archive (Rule 1)")
     p.add_argument("--storage", help="storage file for the simulated backend")
     p.add_argument("--demo", action="store_true", help="use the simulated device")
     p.add_argument("--verbose", action="store_true")
@@ -770,6 +906,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="crash MediaTek Preloader into BROM (works with battery attached)")
     p.add_argument("--timeout", type=float, default=15.0)
     p.add_argument("--out", help="save handshake, scatter & device details to this folder")
+    p.add_argument("--archive-root",
+                   help="device archive root (default: $REVIVE_DEVICE_ARCHIVE or ~/.revive/devices)")
+    p.add_argument("--no-archive", action="store_true",
+                   help="do not save read info to the device archive (Rule 1)")
     p.add_argument("--demo", action="store_true", help="use the simulated device")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_identify)
